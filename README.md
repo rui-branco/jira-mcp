@@ -30,51 +30,50 @@ When working on development tasks, context switching between Jira and your code 
 - [Claude Code](https://claude.ai/code) CLI
 - Jira Cloud account with API access
 
-### Quick Setup
+### Step 1: Add to Claude Code
 
 ```bash
-# Clone to ~/.config (recommended)
-cd ~/.config
-git clone https://github.com/rui-branco/jira-mcp.git
-cd jira-mcp
-
-# Install dependencies
-npm install
-
-# Run interactive setup
-node setup.js
+claude mcp add --transport stdio jira -- npx -y @rui.branco/jira-mcp
 ```
 
-The setup will prompt for:
+### Step 2: Configure Credentials
+
+Run the setup to configure your Jira credentials:
+
+```bash
+npx @rui.branco/jira-mcp setup "your@email.com" "YOUR_API_TOKEN" "https://company.atlassian.net"
+```
+
+Or run interactively:
+
+```bash
+npx @rui.branco/jira-mcp setup
+```
+
+You'll need:
 1. **Jira email** - Your Atlassian account email
 2. **API token** - Generate at [Atlassian API Tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
 3. **Base URL** - Your Jira instance (e.g., `https://company.atlassian.net`)
 
-### Alternative: Command-Line Setup
+### Step 3: Verify
+
+Restart Claude Code and run `/mcp` to verify the server is loaded.
+
+### Alternative: Manual Installation
+
+If you prefer to install manually:
 
 ```bash
-node setup.js "your@email.com" "YOUR_API_TOKEN" "https://company.atlassian.net"
+git clone https://github.com/rui-branco/jira-mcp.git ~/.config/jira-mcp
+cd ~/.config/jira-mcp && npm install
+node setup.js
 ```
 
-### Claude Code Configuration
+Then add to Claude Code:
 
-Add to your `~/.claude.json`:
-
-```json
-{
-  "mcpServers": {
-    "jira": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["~/.config/jira-mcp/index.js"]
-    }
-  }
-}
+```bash
+claude mcp add --transport stdio jira -- node $HOME/.config/jira-mcp/index.js
 ```
-
-> **Note:** If you cloned to a different location, update the path accordingly.
-
-Restart Claude Code to load the MCP server.
 
 ## Usage
 

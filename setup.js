@@ -8,7 +8,10 @@ const configDir = path.join(process.env.HOME, ".config/jira-mcp");
 const configPath = path.join(configDir, "config.json");
 
 // Check for command line arguments
-const args = process.argv.slice(2);
+let args = process.argv.slice(2);
+// Skip "setup" arg if called via index.js
+if (args[0] === "setup") args = args.slice(1);
+
 if (args.length >= 3) {
   // Non-interactive mode: node setup.js <email> <token> <baseUrl>
   const [email, token, baseUrl] = args;
@@ -68,14 +71,9 @@ async function setup() {
   }
 
   console.log("\n=== Setup Complete ===");
-  console.log("\nAdd this to your Claude Code config (~/.claude.json):\n");
-  console.log(`"mcpServers": {
-  "jira": {
-    "type": "stdio",
-    "command": "node",
-    "args": ["${path.join(configDir, "server/index.js")}"]
-  }
-}`);
+  console.log("\nIf you haven't already, add to Claude Code with:\n");
+  console.log("  claude mcp add --transport stdio jira -- npx -y @rui.branco/jira-mcp");
+  console.log("\nThen restart Claude Code and run /mcp to verify.");
 
   rl.close();
 }

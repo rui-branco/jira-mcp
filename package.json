@@ -1,14 +1,32 @@
 {
-  "name": "server",
-  "version": "1.0.0",
+  "name": "@rui.branco/jira-mcp",
+  "version": "1.0.1",
+  "description": "Jira MCP server for Claude Code - fetch tickets, search with JQL, and get Figma designs",
   "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "bin": {
+    "jira-mcp": "./index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "files": [
+    "index.js",
+    "setup.js"
+  ],
+  "scripts": {
+    "setup": "node setup.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "jira",
+    "claude",
+    "claude-code",
+    "atlassian"
+  ],
+  "author": "Rui Branco",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rui-branco/jira-mcp.git"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3",
     "node-fetch": "^2.7.0"

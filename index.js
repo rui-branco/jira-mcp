@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 
+// Handle setup command
+if (process.argv[2] === "setup") {
+  require("./setup.js");
+  return;
+}
+
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const {
