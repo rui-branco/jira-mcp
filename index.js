@@ -353,6 +353,11 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
     output += `**Parent:** ${fields.parent.key} - ${fields.parent.fields?.summary || ""}\n`;
   }
 
+  // Subtasks
+  if (fields.subtasks?.length > 0) {
+    output += `**Subtasks:** ${fields.subtasks.length}\n`;
+  }
+
   // Extract description text and embedded URLs
   const descResult = extractText(fields.description, []);
   output += `\n## Description\n\n`;
@@ -399,16 +404,93 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
     }
   }
 
-  // Linked issues
+  // Subtasks - fetch full details
+  if (fields.subtasks?.length > 0) {
+    output += `\n## Subtasks (${fields.subtasks.length})\n\n`;
+
+    for (const subtask of fields.subtasks) {
+      output += `### ${subtask.key}: ${subtask.fields?.summary || ""}\n`;
+      output += `Status: ${subtask.fields?.status?.name || "Unknown"} | `;
+      output += `Type: ${subtask.fields?.issuetype?.name || "Subtask"}\n`;
+
+      try {
+        const subtaskDetails = await fetchJira(`/issue/${subtask.key}`);
+        const sf = subtaskDetails.fields;
+
+        if (sf.assignee) {
+          output += `Assignee: ${sf.assignee.displayName}\n`;
+        }
+
+        const subtaskDesc = extractText(sf.description, []);
+        if (subtaskDesc.text && subtaskDesc.text.trim()) {
+          const desc = subtaskDesc.text.length > 300
+            ? subtaskDesc.text.substring(0, 300) + "..."
+            : subtaskDesc.text;
+          output += `\n${desc}\n`;
+        }
+        output += "\n";
+      } catch (e) {
+        output += "\n";
+      }
+    }
+  }
+
+  // Linked issues - fetch full details
   if (fields.issuelinks?.length > 0) {
-    output += `\n## Linked Issues\n\n`;
+    output += `\n## Linked Issues (${fields.issuelinks.length})\n\n`;
+
+    // Collect linked issue keys
+    const linkedIssues = [];
     for (const link of fields.issuelinks) {
       if (link.outwardIssue) {
-        output += `- ${link.type.outward}: ${link.outwardIssue.key} - ${link.outwardIssue.fields?.summary || ""}\n`;
+        linkedIssues.push({
+          key: link.outwardIssue.key,
+          relation: link.type.outward,
+          summary: link.outwardIssue.fields?.summary || ""
+        });
       }
       if (link.inwardIssue) {
-        output += `- ${link.type.inward}: ${link.inwardIssue.key} - ${link.inwardIssue.fields?.summary || ""}\n`;
+        linkedIssues.push({
+          key: link.inwardIssue.key,
+          relation: link.type.inward,
+          summary: link.inwardIssue.fields?.summary || ""
+        });
       }
+    }
+
+    // Fetch full details for each linked issue (max 5 to avoid too many API calls)
+    const maxLinkedToFetch = 5;
+    for (let i = 0; i < Math.min(linkedIssues.length, maxLinkedToFetch); i++) {
+      const linked = linkedIssues[i];
+      output += `### ${linked.relation}: ${linked.key}\n`;
+      output += `**${linked.summary}**\n\n`;
+
+      try {
+        const linkedIssue = await fetchJira(`/issue/${linked.key}`);
+        const lf = linkedIssue.fields;
+
+        output += `Status: ${lf.status?.name || "Unknown"} | `;
+        output += `Type: ${lf.issuetype?.name || "Unknown"} | `;
+        output += `Priority: ${lf.priority?.name || "None"}\n`;
+        output += `Assignee: ${lf.assignee?.displayName || "Unassigned"}\n\n`;
+
+        // Get description
+        const linkedDesc = extractText(lf.description, []);
+        if (linkedDesc.text && linkedDesc.text.trim()) {
+          // Truncate long descriptions
+          const desc = linkedDesc.text.length > 500
+            ? linkedDesc.text.substring(0, 500) + "...\n_(truncated)_"
+            : linkedDesc.text;
+          output += `${desc}\n`;
+        }
+        output += "\n";
+      } catch (e) {
+        output += `_Could not fetch details: ${e.message}_\n\n`;
+      }
+    }
+
+    if (linkedIssues.length > maxLinkedToFetch) {
+      output += `\n_...and ${linkedIssues.length - maxLinkedToFetch} more linked issues_\n`;
     }
   }
 
