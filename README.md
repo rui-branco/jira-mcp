@@ -36,28 +36,37 @@ When working on development tasks, context switching between Jira and your code 
 claude mcp add --transport stdio jira -- npx -y @rui.branco/jira-mcp
 ```
 
-### Step 2: Configure Credentials
+### Step 2: Get Your Jira API Token
 
-Run the setup to configure your Jira credentials:
+1. Go to [Atlassian API Tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
+2. Click **"Create API token"**
+3. Enter a label (e.g., "Claude Code MCP")
+4. Click **"Create"**
+5. Copy the token (you won't be able to see it again)
+
+### Step 3: Configure Credentials
+
+Run the setup with your credentials:
 
 ```bash
 npx @rui.branco/jira-mcp setup "your@email.com" "YOUR_API_TOKEN" "https://company.atlassian.net"
 ```
 
-Or run interactively:
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| Email | Your Atlassian account email | `john@company.com` |
+| API Token | The token you created in Step 2 | `ATATT3xFfGF0...` |
+| Base URL | Your Jira instance URL | `https://company.atlassian.net` |
+
+Or run interactively (will prompt for each value):
 
 ```bash
 npx @rui.branco/jira-mcp setup
 ```
 
-You'll need:
-1. **Jira email** - Your Atlassian account email
-2. **API token** - Generate at [Atlassian API Tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
-3. **Base URL** - Your Jira instance (e.g., `https://company.atlassian.net`)
+### Step 4: Verify
 
-### Step 3: Verify
-
-Restart Claude Code and run `/mcp` to verify the server is loaded.
+Restart Claude Code and run `/mcp` to verify the server is connected.
 
 ### Alternative: Manual Installation
 
