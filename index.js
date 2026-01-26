@@ -160,9 +160,38 @@ function parseFigmaUrl(url) {
   return { fileKey, nodeId };
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function figmaFetchWithRetry(url, options = {}, { maxRetries = 3 } = {}) {
+  let attempts = 0;
+
+  while (true) {
+    const response = await fetch(url, {
+      ...options,
+      headers: { ...options.headers, "X-Figma-Token": figmaConfig.token },
+    });
+
+    if (response.ok) {
+      return response;
+    }
+
+    if (response.status === 429) {
+      if (attempts++ >= maxRetries) {
+        const retryAfter = response.headers.get("retry-after") || "60";
+        return { rateLimited: true, retryAfter };
+      }
+      const retryAfterSec = Number(response.headers.get("retry-after")) || 10;
+      await sleep(retryAfterSec * 1000);
+      continue;
+    }
+
+    return response;
+  }
+}
+
 async function fetchFigmaDesign(url) {
   if (!figmaConfig) {
-    return { error: "Figma not configured. Run: node ~/.config/figma-mcp/server/setup.js" };
+    return { error: "Figma not configured. Run: node ~/.config/figma-mcp/setup.js" };
   }
 
   const parsed = parseFigmaUrl(url);
@@ -174,14 +203,13 @@ async function fetchFigmaDesign(url) {
 
   try {
     // Get file info
-    const fileRes = await fetch(`https://api.figma.com/v1/files/${fileKey}?depth=1`, {
-      headers: { "X-Figma-Token": figmaConfig.token },
-    });
+    const fileRes = await figmaFetchWithRetry(`https://api.figma.com/v1/files/${fileKey}?depth=1`);
 
+    if (fileRes.rateLimited) {
+      return { error: `Figma API rate limit exceeded. Try again in ${fileRes.retryAfter} seconds.` };
+    }
     if (!fileRes.ok) {
-      if (fileRes.status === 429) {
-        return { error: "Figma API rate limit exceeded. Please wait a few minutes and try again." };
-      } else if (fileRes.status === 403) {
+      if (fileRes.status === 403) {
         return { error: "Figma access denied. Check your token or file permissions." };
       } else if (fileRes.status === 404) {
         return { error: "Figma file not found. Check the URL." };
@@ -206,9 +234,8 @@ async function fetchFigmaDesign(url) {
     // If specific node, get its info and export images
     if (nodeId) {
       // Get node info with depth=2 to see children
-      const nodeRes = await fetch(
-        `https://api.figma.com/v1/files/${fileKey}/nodes?ids=${encodeURIComponent(nodeId)}&depth=2`,
-        { headers: { "X-Figma-Token": figmaConfig.token } }
+      const nodeRes = await figmaFetchWithRetry(
+        `https://api.figma.com/v1/files/${fileKey}/nodes?ids=${encodeURIComponent(nodeId)}&depth=2`
       );
 
       if (nodeRes.ok) {
@@ -240,9 +267,8 @@ async function fetchFigmaDesign(url) {
             const childIds = exportableChildren.slice(0, 8).map(c => c.id);
             const idsParam = childIds.join(",");
 
-            const imgRes = await fetch(
-              `https://api.figma.com/v1/images/${fileKey}?ids=${encodeURIComponent(idsParam)}&format=png&scale=2`,
-              { headers: { "X-Figma-Token": figmaConfig.token } }
+            const imgRes = await figmaFetchWithRetry(
+              `https://api.figma.com/v1/images/${fileKey}?ids=${encodeURIComponent(idsParam)}&format=png&scale=2`
             );
 
             if (imgRes.ok) {
@@ -271,9 +297,8 @@ async function fetchFigmaDesign(url) {
             }
           } else {
             // Export whole frame
-            const imgRes = await fetch(
-              `https://api.figma.com/v1/images/${fileKey}?ids=${encodeURIComponent(nodeId)}&format=png&scale=2`,
-              { headers: { "X-Figma-Token": figmaConfig.token } }
+            const imgRes = await figmaFetchWithRetry(
+              `https://api.figma.com/v1/images/${fileKey}?ids=${encodeURIComponent(nodeId)}&format=png&scale=2`
             );
 
             if (imgRes.ok) {
