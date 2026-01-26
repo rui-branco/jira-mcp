@@ -125,6 +125,34 @@ function extractTextSimple(content) {
   return result.text;
 }
 
+// ============ JIRA URL DETECTION ============
+
+function findJiraTicketKeys(text, currentKey = null) {
+  if (!text) return [];
+
+  // Match Jira URLs like https://company.atlassian.net/browse/PROJ-123
+  const urlRegex = /https?:\/\/[^\s]+\/browse\/([A-Z][A-Z0-9]+-\d+)/g;
+  // Match ticket keys directly like PROJ-123
+  const keyRegex = /\b([A-Z][A-Z0-9]+-\d+)\b/g;
+
+  const keys = new Set();
+  let match;
+
+  while ((match = urlRegex.exec(text)) !== null) {
+    if (match[1] !== currentKey) {
+      keys.add(match[1]);
+    }
+  }
+
+  while ((match = keyRegex.exec(text)) !== null) {
+    if (match[1] !== currentKey) {
+      keys.add(match[1]);
+    }
+  }
+
+  return [...keys];
+}
+
 // ============ FIGMA FUNCTIONS ============
 
 function findFigmaUrls(text) {
@@ -491,6 +519,69 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
 
     if (linkedIssues.length > maxLinkedToFetch) {
       output += `\n_...and ${linkedIssues.length - maxLinkedToFetch} more linked issues_\n`;
+    }
+  }
+
+  // Find and fetch referenced Jira tickets from text (URLs and ticket keys)
+  const referencedKeys = findJiraTicketKeys(allText, issueKey);
+
+  // Exclude already fetched tickets (linked issues, subtasks, parent)
+  const alreadyFetched = new Set();
+  alreadyFetched.add(issueKey);
+  if (fields.parent) alreadyFetched.add(fields.parent.key);
+  if (fields.subtasks) fields.subtasks.forEach(s => alreadyFetched.add(s.key));
+  if (fields.issuelinks) {
+    fields.issuelinks.forEach(link => {
+      if (link.outwardIssue) alreadyFetched.add(link.outwardIssue.key);
+      if (link.inwardIssue) alreadyFetched.add(link.inwardIssue.key);
+    });
+  }
+
+  const ticketsToFetch = referencedKeys.filter(key => !alreadyFetched.has(key));
+
+  if (ticketsToFetch.length > 0) {
+    output += `\n## Referenced Tickets (${ticketsToFetch.length})\n\n`;
+    output += `_Auto-detected from description/comments_\n\n`;
+
+    const maxReferencedToFetch = 5;
+    for (let i = 0; i < Math.min(ticketsToFetch.length, maxReferencedToFetch); i++) {
+      const refKey = ticketsToFetch[i];
+
+      try {
+        const refIssue = await fetchJira(`/issue/${refKey}`);
+        const rf = refIssue.fields;
+
+        output += `### ${refKey}: ${rf.summary || ""}\n`;
+        output += `Status: ${rf.status?.name || "Unknown"} | `;
+        output += `Type: ${rf.issuetype?.name || "Unknown"} | `;
+        output += `Priority: ${rf.priority?.name || "None"}\n`;
+        output += `Assignee: ${rf.assignee?.displayName || "Unassigned"}\n\n`;
+
+        // Get description
+        const refDesc = extractText(rf.description, []);
+        if (refDesc.text && refDesc.text.trim()) {
+          const desc = refDesc.text.length > 500
+            ? refDesc.text.substring(0, 500) + "...\n_(truncated)_"
+            : refDesc.text;
+          output += `${desc}\n`;
+        }
+
+        // Check for Figma links in referenced ticket
+        const refFigmaUrls = findFigmaUrls(refDesc.text);
+        if (refFigmaUrls.length > 0) {
+          output += `\n**Figma:** ${refFigmaUrls.join(", ")}\n`;
+          // Add to allText so Figma gets fetched
+          allText += " " + refDesc.text;
+        }
+
+        output += "\n";
+      } catch (e) {
+        output += `### ${refKey}\n_Could not fetch: ${e.message}_\n\n`;
+      }
+    }
+
+    if (ticketsToFetch.length > maxReferencedToFetch) {
+      output += `_...and ${ticketsToFetch.length - maxReferencedToFetch} more referenced tickets_\n`;
     }
   }
 
