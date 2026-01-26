@@ -396,6 +396,46 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
   let allUrls = [...descResult.urls];
   let allText = descResult.text;
 
+  // Fetch FULL parent ticket details
+  if (fields.parent) {
+    output += `\n## Parent Ticket: ${fields.parent.key}\n\n`;
+    try {
+      const parentIssue = await fetchJira(`/issue/${fields.parent.key}?expand=renderedFields`);
+      const pf = parentIssue.fields;
+
+      output += `**${pf.summary}**\n`;
+      output += `Status: ${pf.status?.name || "Unknown"} | `;
+      output += `Type: ${pf.issuetype?.name || "Unknown"} | `;
+      output += `Priority: ${pf.priority?.name || "None"}\n`;
+      output += `Assignee: ${pf.assignee?.displayName || "Unassigned"}\n\n`;
+
+      // Full description
+      const parentDesc = extractText(pf.description, []);
+      if (parentDesc.text && parentDesc.text.trim()) {
+        output += `### Description\n${parentDesc.text}\n`;
+        allText += " " + parentDesc.text;
+        allUrls = allUrls.concat(parentDesc.urls);
+      }
+
+      // Parent comments
+      if (pf.comment?.comments?.length > 0) {
+        output += `\n### Comments (${pf.comment.comments.length})\n`;
+        for (const comment of pf.comment.comments) {
+          const author = comment.author?.displayName || "Unknown";
+          const created = new Date(comment.created).toLocaleString();
+          const commentText = extractText(comment.body, []);
+          output += `**${author}** - ${created}\n`;
+          output += `${commentText.text}\n\n`;
+          allText += " " + commentText.text;
+        }
+      }
+
+      output += "\n---\n\n";
+    } catch (e) {
+      output += `_Could not fetch parent details: ${e.message}_\n\n`;
+    }
+  }
+
   // Get comments
   if (fields.comment?.comments?.length > 0) {
     output += `\n## Comments (${fields.comment.comments.length})\n\n`;
@@ -486,15 +526,15 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
       }
     }
 
-    // Fetch full details for each linked issue (max 5 to avoid too many API calls)
-    const maxLinkedToFetch = 5;
+    // Fetch full details for each linked issue
+    const maxLinkedToFetch = 10;
     for (let i = 0; i < Math.min(linkedIssues.length, maxLinkedToFetch); i++) {
       const linked = linkedIssues[i];
       output += `### ${linked.relation}: ${linked.key}\n`;
       output += `**${linked.summary}**\n\n`;
 
       try {
-        const linkedIssue = await fetchJira(`/issue/${linked.key}`);
+        const linkedIssue = await fetchJira(`/issue/${linked.key}?expand=renderedFields`);
         const lf = linkedIssue.fields;
 
         output += `Status: ${lf.status?.name || "Unknown"} | `;
@@ -502,16 +542,25 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
         output += `Priority: ${lf.priority?.name || "None"}\n`;
         output += `Assignee: ${lf.assignee?.displayName || "Unassigned"}\n\n`;
 
-        // Get description
+        // Get FULL description (no truncation)
         const linkedDesc = extractText(lf.description, []);
         if (linkedDesc.text && linkedDesc.text.trim()) {
-          // Truncate long descriptions
-          const desc = linkedDesc.text.length > 500
-            ? linkedDesc.text.substring(0, 500) + "...\n_(truncated)_"
-            : linkedDesc.text;
-          output += `${desc}\n`;
+          output += `#### Description\n${linkedDesc.text}\n`;
         }
-        output += "\n";
+
+        // Get comments from linked ticket
+        if (lf.comment?.comments?.length > 0) {
+          output += `\n#### Comments (${lf.comment.comments.length})\n`;
+          for (const comment of lf.comment.comments) {
+            const author = comment.author?.displayName || "Unknown";
+            const created = new Date(comment.created).toLocaleString();
+            const commentText = extractText(comment.body, []);
+            output += `**${author}** - ${created}\n`;
+            output += `${commentText.text}\n\n`;
+          }
+        }
+
+        output += "\n---\n\n";
       } catch (e) {
         output += `_Could not fetch details: ${e.message}_\n\n`;
       }
@@ -543,12 +592,12 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
     output += `\n## Referenced Tickets (${ticketsToFetch.length})\n\n`;
     output += `_Auto-detected from description/comments_\n\n`;
 
-    const maxReferencedToFetch = 5;
+    const maxReferencedToFetch = 10;
     for (let i = 0; i < Math.min(ticketsToFetch.length, maxReferencedToFetch); i++) {
       const refKey = ticketsToFetch[i];
 
       try {
-        const refIssue = await fetchJira(`/issue/${refKey}`);
+        const refIssue = await fetchJira(`/issue/${refKey}?expand=renderedFields`);
         const rf = refIssue.fields;
 
         output += `### ${refKey}: ${rf.summary || ""}\n`;
@@ -557,24 +606,32 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
         output += `Priority: ${rf.priority?.name || "None"}\n`;
         output += `Assignee: ${rf.assignee?.displayName || "Unassigned"}\n\n`;
 
-        // Get description
+        // Get FULL description (no truncation)
         const refDesc = extractText(rf.description, []);
         if (refDesc.text && refDesc.text.trim()) {
-          const desc = refDesc.text.length > 500
-            ? refDesc.text.substring(0, 500) + "...\n_(truncated)_"
-            : refDesc.text;
-          output += `${desc}\n`;
+          output += `#### Description\n${refDesc.text}\n`;
+        }
+
+        // Get comments from referenced ticket
+        if (rf.comment?.comments?.length > 0) {
+          output += `\n#### Comments (${rf.comment.comments.length})\n`;
+          for (const comment of rf.comment.comments) {
+            const author = comment.author?.displayName || "Unknown";
+            const created = new Date(comment.created).toLocaleString();
+            const commentText = extractText(comment.body, []);
+            output += `**${author}** - ${created}\n`;
+            output += `${commentText.text}\n\n`;
+          }
         }
 
         // Check for Figma links in referenced ticket
         const refFigmaUrls = findFigmaUrls(refDesc.text);
         if (refFigmaUrls.length > 0) {
-          output += `\n**Figma:** ${refFigmaUrls.join(", ")}\n`;
-          // Add to allText so Figma gets fetched
+          output += `**Figma:** ${refFigmaUrls.join(", ")}\n`;
           allText += " " + refDesc.text;
         }
 
-        output += "\n";
+        output += "\n---\n\n";
       } catch (e) {
         output += `### ${refKey}\n_Could not fetch: ${e.message}_\n\n`;
       }
