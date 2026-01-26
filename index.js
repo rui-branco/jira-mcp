@@ -162,7 +162,7 @@ function parseFigmaUrl(url) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function figmaFetchWithRetry(url, options = {}, { maxRetries = 3 } = {}) {
+async function figmaFetchWithRetry(url, options = {}, { maxRetries = 3, maxWaitSec = 30 } = {}) {
   let attempts = 0;
 
   while (true) {
@@ -176,11 +176,16 @@ async function figmaFetchWithRetry(url, options = {}, { maxRetries = 3 } = {}) {
     }
 
     if (response.status === 429) {
-      if (attempts++ >= maxRetries) {
-        const retryAfter = response.headers.get("retry-after") || "60";
-        return { rateLimited: true, retryAfter };
+      const retryAfterSec = Number(response.headers.get("retry-after")) || 60;
+
+      // Don't retry if wait is too long (monthly limit) or too many attempts
+      if (retryAfterSec > maxWaitSec || attempts++ >= maxRetries) {
+        const waitTime = retryAfterSec > 3600
+          ? `${Math.round(retryAfterSec / 3600)} hours (monthly limit reached)`
+          : `${retryAfterSec} seconds`;
+        return { rateLimited: true, retryAfter: waitTime };
       }
-      const retryAfterSec = Number(response.headers.get("retry-after")) || 10;
+
       await sleep(retryAfterSec * 1000);
       continue;
     }
