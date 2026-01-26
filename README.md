@@ -33,7 +33,8 @@ When working on development tasks, context switching between Jira and your code 
 ### Quick Setup
 
 ```bash
-# Clone the repository
+# Clone to ~/.config (recommended)
+cd ~/.config
 git clone https://github.com/rui-branco/jira-mcp.git
 cd jira-mcp
 
@@ -65,11 +66,13 @@ Add to your `~/.claude.json`:
     "jira": {
       "type": "stdio",
       "command": "node",
-      "args": ["/path/to/jira-mcp/index.js"]
+      "args": ["~/.config/jira-mcp/index.js"]
     }
   }
 }
 ```
+
+> **Note:** If you cloned to a different location, update the path accordingly.
 
 Restart Claude Code to load the MCP server.
 
