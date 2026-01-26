@@ -1,0 +1,12 @@
+# Config files with secrets
+config.json
+../config.json
+
+# macOS
+.DS_Store
+
+# Dependencies
+node_modules/
+
+# Downloaded attachments
+../attachments/
