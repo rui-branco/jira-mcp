@@ -42,17 +42,26 @@ if (!fs.existsSync(attachmentDir)) {
 
 // ============ JIRA FUNCTIONS ============
 
-async function fetchJira(endpoint) {
+async function fetchJira(endpoint, options = {}) {
+  const { method = "GET", body } = options;
+  const headers = {
+    Authorization: `Basic ${auth}`,
+    Accept: "application/json",
+  };
+  if (body) {
+    headers["Content-Type"] = "application/json";
+  }
   const response = await fetch(`${jiraConfig.baseUrl}/rest/api/3${endpoint}`, {
-    headers: {
-      Authorization: `Basic ${auth}`,
-      Accept: "application/json",
-    },
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
   });
   if (!response.ok) {
-    throw new Error(`Jira API error: ${response.status} ${response.statusText}`);
+    const errorBody = await response.text().catch(() => "");
+    throw new Error(`Jira API error: ${response.status} ${response.statusText}${errorBody ? ` - ${errorBody}` : ""}`);
   }
-  return response.json();
+  const text = await response.text();
+  return text ? JSON.parse(text) : {};
 }
 
 async function downloadAttachment(url, filename, issueKey) {
@@ -449,7 +458,7 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
       const author = comment.author?.displayName || "Unknown";
       const created = new Date(comment.created).toLocaleString();
       const commentResult = extractText(comment.body, []);
-      output += `### ${author} - ${created}\n`;
+      output += `### ${author} - ${created} (id: ${comment.id})\n`;
       output += commentResult.text + "\n\n";
       allText += " " + commentResult.text;
       allUrls = allUrls.concat(commentResult.urls);
@@ -744,6 +753,87 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["jql"],
         },
       },
+      {
+        name: "jira_add_comment",
+        description: "Add a comment to a Jira ticket.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
+            comment: { type: "string", description: "The comment text to add" },
+          },
+          required: ["issueKey", "comment"],
+        },
+      },
+      {
+        name: "jira_reply_comment",
+        description: "Reply to a specific comment on a Jira ticket. Quotes the original comment and mentions the author.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
+            commentId: { type: "string", description: "The ID of the comment to reply to. Use jira_get_ticket to see comments and their IDs." },
+            reply: { type: "string", description: "The reply text" },
+          },
+          required: ["issueKey", "commentId", "reply"],
+        },
+      },
+      {
+        name: "jira_edit_comment",
+        description: "Edit an existing comment on a Jira ticket. Replaces the comment text.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
+            commentId: { type: "string", description: "The ID of the comment to edit. Use jira_get_ticket to see comments and their IDs." },
+            comment: { type: "string", description: "The new comment text" },
+          },
+          required: ["issueKey", "commentId", "comment"],
+        },
+      },
+      {
+        name: "jira_delete_comment",
+        description: "Delete a comment from a Jira ticket. This action is irreversible.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
+            commentId: { type: "string", description: "The ID of the comment to delete. Use jira_get_ticket to see comments and their IDs." },
+          },
+          required: ["issueKey", "commentId"],
+        },
+      },
+      {
+        name: "jira_transition",
+        description: "Change the status of a Jira ticket. Use without transitionId to list available transitions, or with transitionId to execute one.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
+            transitionId: { type: "string", description: "The transition ID to execute. Omit to list available transitions." },
+          },
+          required: ["issueKey"],
+        },
+      },
+      {
+        name: "jira_update_ticket",
+        description: "Update fields on a Jira ticket. IMPORTANT: Only pass the fields you want to change. Omitted fields are left untouched.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
+            summary: { type: "string", description: "Text to add to the title. By default APPENDS to existing title. Set replaceSummary=true to replace instead." },
+            replaceSummary: { type: "boolean", description: "If true, replaces the entire title. Default is false (append)." },
+            description: { type: "string", description: "Text to add to the description. By default APPENDS to existing content. Set replaceDescription=true to replace instead." },
+            replaceDescription: { type: "boolean", description: "If true, replaces the entire description. Default is false (append)." },
+            removeFromDescription: { type: "string", description: "Text to find and remove from the existing description." },
+            assignee: { type: "string", description: "Assignee account ID (use 'unassigned' to clear)" },
+            priority: { type: "string", description: "Priority name (e.g., High, Medium, Low)" },
+            labels: { type: "array", items: { type: "string" }, description: "Labels to set on the ticket" },
+          },
+          required: ["issueKey"],
+        },
+      },
     ],
   };
 });
@@ -794,6 +884,199 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } else if (name === "jira_search") {
       const result = await searchTickets(args.jql, args.maxResults || 10);
       return { content: [{ type: "text", text: result }] };
+
+    } else if (name === "jira_add_comment") {
+      const body = {
+        body: {
+          version: 1,
+          type: "doc",
+          content: [
+            {
+              type: "paragraph",
+              content: [{ type: "text", text: args.comment }],
+            },
+          ],
+        },
+      };
+      const result = await fetchJira(`/issue/${args.issueKey}/comment`, { method: "POST", body });
+      const author = result.author?.displayName || "Unknown";
+      const created = new Date(result.created).toLocaleString();
+      return { content: [{ type: "text", text: `Comment added to ${args.issueKey} by ${author} at ${created}.` }] };
+
+    } else if (name === "jira_reply_comment") {
+      // Fetch the original comment
+      const original = await fetchJira(`/issue/${args.issueKey}/comment/${args.commentId}`);
+      const originalAuthor = original.author?.displayName || "Unknown";
+      const originalAccountId = original.author?.accountId;
+      const originalText = extractTextSimple(original.body).trim();
+      // Truncate quote if too long
+      const quote = originalText.length > 200 ? originalText.substring(0, 200) + "..." : originalText;
+
+      // Build ADF with mention, quote, and reply
+      const replyContent = [];
+
+      // Mention the original author
+      if (originalAccountId) {
+        replyContent.push({
+          type: "paragraph",
+          content: [
+            { type: "mention", attrs: { id: originalAccountId, text: `@${originalAuthor}` } },
+          ],
+        });
+      }
+
+      // Quote the original comment
+      replyContent.push({
+        type: "blockquote",
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: quote }] },
+        ],
+      });
+
+      // The reply text
+      replyContent.push({
+        type: "paragraph",
+        content: [{ type: "text", text: args.reply }],
+      });
+
+      const body = {
+        body: {
+          version: 1,
+          type: "doc",
+          content: replyContent,
+        },
+      };
+      const result = await fetchJira(`/issue/${args.issueKey}/comment`, { method: "POST", body });
+      const author = result.author?.displayName || "Unknown";
+      const created = new Date(result.created).toLocaleString();
+      return { content: [{ type: "text", text: `Reply to ${originalAuthor}'s comment posted on ${args.issueKey} by ${author} at ${created}.` }] };
+
+    } else if (name === "jira_edit_comment") {
+      const body = {
+        body: {
+          version: 1,
+          type: "doc",
+          content: [
+            {
+              type: "paragraph",
+              content: [{ type: "text", text: args.comment }],
+            },
+          ],
+        },
+      };
+      const result = await fetchJira(`/issue/${args.issueKey}/comment/${args.commentId}`, { method: "PUT", body });
+      return { content: [{ type: "text", text: `Comment ${args.commentId} on ${args.issueKey} updated.` }] };
+
+    } else if (name === "jira_delete_comment") {
+      await fetchJira(`/issue/${args.issueKey}/comment/${args.commentId}`, { method: "DELETE" });
+      return { content: [{ type: "text", text: `Comment ${args.commentId} on ${args.issueKey} deleted.` }] };
+
+    } else if (name === "jira_transition") {
+      if (!args.transitionId) {
+        // List available transitions
+        const result = await fetchJira(`/issue/${args.issueKey}/transitions`);
+        let output = `# Available transitions for ${args.issueKey}\n\n`;
+        for (const t of result.transitions || []) {
+          output += `- **${t.name}** (id: ${t.id}) → status: ${t.to?.name || "Unknown"}\n`;
+        }
+        if (!result.transitions?.length) {
+          output += "_No transitions available._\n";
+        }
+        return { content: [{ type: "text", text: output }] };
+      }
+      // Execute transition
+      await fetchJira(`/issue/${args.issueKey}/transitions`, {
+        method: "POST",
+        body: { transition: { id: args.transitionId } },
+      });
+      return { content: [{ type: "text", text: `Transition ${args.transitionId} executed on ${args.issueKey}.` }] };
+
+    } else if (name === "jira_update_ticket") {
+      const fields = {};
+      if (args.summary) {
+        if (args.replaceSummary) {
+          fields.summary = args.summary;
+        } else {
+          // Append to existing title (default)
+          const issue = await fetchJira(`/issue/${args.issueKey}?fields=summary`);
+          const existing = issue.fields?.summary || "";
+          fields.summary = existing + " " + args.summary;
+        }
+      }
+      if (args.description) {
+        const newParagraph = {
+          type: "paragraph",
+          content: [{ type: "text", text: args.description }],
+        };
+        if (args.replaceDescription) {
+          // Full replace
+          fields.description = {
+            version: 1,
+            type: "doc",
+            content: [newParagraph],
+          };
+        } else {
+          // Append to existing (default)
+          const issue = await fetchJira(`/issue/${args.issueKey}?fields=description`);
+          const existing = issue.fields?.description;
+          if (existing && existing.content) {
+            existing.content.push(newParagraph);
+            fields.description = existing;
+          } else {
+            fields.description = {
+              version: 1,
+              type: "doc",
+              content: [newParagraph],
+            };
+          }
+        }
+      }
+      if (args.removeFromDescription) {
+        const issue = await fetchJira(`/issue/${args.issueKey}?fields=description`);
+        const existing = issue.fields?.description;
+        if (existing && existing.content) {
+          // Recursively remove matching text from all text nodes
+          function removeText(nodes) {
+            return nodes.map(node => {
+              if (node.type === "text" && node.text) {
+                node.text = node.text.replace(args.removeFromDescription, "");
+              }
+              if (node.content) {
+                node.content = removeText(node.content);
+              }
+              return node;
+            }).filter(node => {
+              // Remove empty text nodes
+              if (node.type === "text" && (!node.text || !node.text.trim())) return false;
+              // Remove empty paragraphs
+              if (node.type === "paragraph" && (!node.content || node.content.length === 0)) return false;
+              return true;
+            });
+          }
+          existing.content = removeText(existing.content);
+          fields.description = existing;
+        }
+      }
+      if (args.assignee) {
+        fields.assignee = args.assignee === "unassigned"
+          ? null
+          : { accountId: args.assignee };
+      }
+      if (args.priority) {
+        fields.priority = { name: args.priority };
+      }
+      if (args.labels) {
+        fields.labels = args.labels;
+      }
+
+      if (Object.keys(fields).length === 0) {
+        return { content: [{ type: "text", text: "No fields provided to update." }] };
+      }
+
+      await fetchJira(`/issue/${args.issueKey}`, { method: "PUT", body: { fields } });
+      const updated = Object.keys(fields).join(", ");
+      return { content: [{ type: "text", text: `Updated ${args.issueKey}: ${updated}.` }] };
+
     } else {
       throw new Error(`Unknown tool: ${name}`);
     }
