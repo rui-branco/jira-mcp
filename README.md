@@ -149,8 +149,14 @@ To enable Figma integration:
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `jira_get_ticket` | Fetch a ticket by key | `issueKey` (required), `downloadImages`, `fetchFigma` |
-| `jira_search` | Search with JQL | `jql` (required), `maxResults` |
+| `jira_get_ticket` | Fetch a ticket by key with description, comments, attachments, and Figma designs | `issueKey` (required), `downloadImages`, `fetchFigma` |
+| `jira_search` | Search tickets using JQL | `jql` (required), `maxResults` |
+| `jira_add_comment` | Add a comment to a ticket | `issueKey` (required), `comment` (required) |
+| `jira_reply_comment` | Reply to a specific comment with quote and mention | `issueKey` (required), `commentId` (required), `reply` (required) |
+| `jira_edit_comment` | Edit an existing comment | `issueKey` (required), `commentId` (required), `comment` (required) |
+| `jira_delete_comment` | Delete a comment (irreversible) | `issueKey` (required), `commentId` (required) |
+| `jira_transition` | Change ticket status (omit `transitionId` to list available transitions) | `issueKey` (required), `transitionId` |
+| `jira_update_ticket` | Update ticket fields (summary, description, assignee, priority, labels) | `issueKey` (required), plus optional field parameters |
 
 ### Configuration
 
