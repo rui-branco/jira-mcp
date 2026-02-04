@@ -149,6 +149,7 @@ To enable Figma integration:
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
+| `jira_get_myself` | Get the current authenticated user's accountId and info (use for assigning tickets) | none |
 | `jira_get_ticket` | Fetch a ticket by key with description, comments, attachments, and Figma designs | `issueKey` (required), `downloadImages`, `fetchFigma` |
 | `jira_search` | Search tickets using JQL | `jql` (required), `maxResults` |
 | `jira_add_comment` | Add a comment to a ticket | `issueKey` (required), `comment` (required) |

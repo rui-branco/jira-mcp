@@ -720,6 +720,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
+        name: "jira_get_myself",
+        description: "Get the current authenticated user's info including accountId. Use this to get your account ID for assigning tickets.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+          required: [],
+        },
+      },
+      {
         name: "jira_get_ticket",
         description: "Fetch a Jira ticket by its key (e.g., MODS-12115). Returns full details including description, comments, attachments, and linked Figma designs.",
         inputSchema: {
@@ -842,7 +851,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
-    if (name === "jira_get_ticket") {
+    if (name === "jira_get_myself") {
+      const result = await fetchJira("/myself");
+      return {
+        content: [{
+          type: "text",
+          text: `**Account ID:** ${result.accountId}\n**Display Name:** ${result.displayName}\n**Email:** ${result.emailAddress || "N/A"}`
+        }]
+      };
+
+    } else if (name === "jira_get_ticket") {
       const downloadImages = args.downloadImages !== false;
       const fetchFigma = args.fetchFigma !== false;
       const result = await getTicket(args.issueKey, downloadImages, fetchFigma);
