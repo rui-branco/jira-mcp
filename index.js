@@ -814,12 +814,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jira_transition",
-        description: "Change the status of a Jira ticket. Use without transitionId to list available transitions, or with transitionId to execute one.",
+        description: "Change the status of a Jira ticket. Use targetStatus to transition by name (auto-handles intermediate steps like In Progress), transitionId for direct transition, or omit both to list available transitions.",
         inputSchema: {
           type: "object",
           properties: {
             issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
             transitionId: { type: "string", description: "The transition ID to execute. Omit to list available transitions." },
+            targetStatus: { type: "string", description: "Target status name (e.g., 'Review', 'Done'). Will auto-transition through intermediate states if needed." },
           },
           required: ["issueKey"],
         },
@@ -990,7 +991,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Comment ${args.commentId} on ${args.issueKey} deleted.` }] };
 
     } else if (name === "jira_transition") {
-      if (!args.transitionId) {
+      if (!args.transitionId && !args.targetStatus) {
         // List available transitions
         const result = await fetchJira(`/issue/${args.issueKey}/transitions`);
         let output = `# Available transitions for ${args.issueKey}\n\n`;
@@ -1002,7 +1003,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         return { content: [{ type: "text", text: output }] };
       }
-      // Execute transition
+
+      // If targetStatus is provided, find the transition by status name
+      if (args.targetStatus) {
+        const targetLower = args.targetStatus.toLowerCase();
+        const transitions = [];
+
+        // Try to reach target status, with up to 3 intermediate transitions
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const result = await fetchJira(`/issue/${args.issueKey}/transitions`);
+          const available = result.transitions || [];
+
+          // Check if target status is directly available
+          const directMatch = available.find(t =>
+            t.to?.name?.toLowerCase() === targetLower ||
+            t.name?.toLowerCase() === targetLower
+          );
+
+          if (directMatch) {
+            await fetchJira(`/issue/${args.issueKey}/transitions`, {
+              method: "POST",
+              body: { transition: { id: directMatch.id } },
+            });
+            transitions.push(directMatch.to?.name || directMatch.name);
+            return { content: [{ type: "text", text: `Transitioned ${args.issueKey} to ${transitions.join(" → ")}.` }] };
+          }
+
+          // Target not available, try "In Progress" as intermediate step
+          const inProgress = available.find(t =>
+            t.to?.name?.toLowerCase() === "in progress" ||
+            t.name?.toLowerCase() === "in progress"
+          );
+
+          if (inProgress) {
+            await fetchJira(`/issue/${args.issueKey}/transitions`, {
+              method: "POST",
+              body: { transition: { id: inProgress.id } },
+            });
+            transitions.push(inProgress.to?.name || "In Progress");
+            continue; // Try again to find target
+          }
+
+          // No path found
+          break;
+        }
+
+        // Could not reach target status
+        const result = await fetchJira(`/issue/${args.issueKey}/transitions`);
+        const availableNames = (result.transitions || []).map(t => t.to?.name || t.name).join(", ");
+        return { content: [{ type: "text", text: `Could not transition to "${args.targetStatus}". Available: ${availableNames}` }] };
+      }
+
+      // Execute transition by ID
       await fetchJira(`/issue/${args.issueKey}/transitions`, {
         method: "POST",
         body: { transition: { id: args.transitionId } },

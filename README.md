@@ -156,7 +156,7 @@ To enable Figma integration:
 | `jira_reply_comment` | Reply to a specific comment with quote and mention | `issueKey` (required), `commentId` (required), `reply` (required) |
 | `jira_edit_comment` | Edit an existing comment | `issueKey` (required), `commentId` (required), `comment` (required) |
 | `jira_delete_comment` | Delete a comment (irreversible) | `issueKey` (required), `commentId` (required) |
-| `jira_transition` | Change ticket status (omit `transitionId` to list available transitions) | `issueKey` (required), `transitionId` |
+| `jira_transition` | Change ticket status by name or ID (auto-handles intermediate steps) | `issueKey` (required), `targetStatus` or `transitionId` |
 | `jira_update_ticket` | Update ticket fields (summary, description, assignee, priority, labels) | `issueKey` (required), plus optional field parameters |
 
 ### Configuration
