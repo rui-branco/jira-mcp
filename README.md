@@ -102,6 +102,16 @@ claude mcp add --transport stdio jira -- node $HOME/.config/jira-mcp/index.js
 # Uses JQL: assignee = currentUser() AND status != Done
 ```
 
+### Add Comments with Mentions
+
+Use `@FirstName LastName` syntax to mention users in comments:
+
+```
+> Add a comment to PROJ-123: "@John Doe Please review this implementation"
+
+# The mention is automatically resolved and the user gets notified
+```
+
 ### Example Output
 
 ```
@@ -152,9 +162,9 @@ To enable Figma integration:
 | `jira_get_myself` | Get the current authenticated user's accountId and info (use for assigning tickets) | none |
 | `jira_get_ticket` | Fetch a ticket by key with description, comments, attachments, and Figma designs | `issueKey` (required), `downloadImages`, `fetchFigma` |
 | `jira_search` | Search tickets using JQL | `jql` (required), `maxResults` |
-| `jira_add_comment` | Add a comment to a ticket | `issueKey` (required), `comment` (required) |
+| `jira_add_comment` | Add a comment to a ticket (supports @mentions) | `issueKey` (required), `comment` (required) |
 | `jira_reply_comment` | Reply to a specific comment with quote and mention | `issueKey` (required), `commentId` (required), `reply` (required) |
-| `jira_edit_comment` | Edit an existing comment | `issueKey` (required), `commentId` (required), `comment` (required) |
+| `jira_edit_comment` | Edit an existing comment (supports @mentions) | `issueKey` (required), `commentId` (required), `comment` (required) |
 | `jira_delete_comment` | Delete a comment (irreversible) | `issueKey` (required), `commentId` (required) |
 | `jira_transition` | Change ticket status by name or ID (auto-handles intermediate steps) | `issueKey` (required), `targetStatus` or `transitionId` |
 | `jira_update_ticket` | Update ticket fields (summary, description, assignee, priority, labels) | `issueKey` (required), plus optional field parameters |

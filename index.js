@@ -140,6 +140,100 @@ function extractTextSimple(content) {
   return result.text;
 }
 
+// ============ USER SEARCH & MENTIONS ============
+
+// Cache for user lookups to avoid repeated API calls
+const userCache = new Map();
+
+async function searchUser(query) {
+  // Check cache first
+  const cacheKey = query.toLowerCase();
+  if (userCache.has(cacheKey)) {
+    return userCache.get(cacheKey);
+  }
+
+  try {
+    // Search for users by display name
+    const users = await fetchJira(`/user/search?query=${encodeURIComponent(query)}&maxResults=5`);
+    if (users && users.length > 0) {
+      // Find best match - prefer exact match, then starts with, then contains
+      const exactMatch = users.find(u => u.displayName.toLowerCase() === query.toLowerCase());
+      const startsWithMatch = users.find(u => u.displayName.toLowerCase().startsWith(query.toLowerCase()));
+      const user = exactMatch || startsWithMatch || users[0];
+
+      const result = { accountId: user.accountId, displayName: user.displayName };
+      userCache.set(cacheKey, result);
+      return result;
+    }
+  } catch (e) {
+    // User search failed, return null
+  }
+  return null;
+}
+
+// Parse text with @mentions and build ADF content
+async function buildCommentADF(text) {
+  // Match @FirstName LastName pattern (2 capitalized words)
+  const mentionRegex = /@([A-Z][a-z]+\s[A-Z][a-z]+)/g;
+
+  const content = [];
+  let lastIndex = 0;
+  let match;
+  const matches = [];
+
+  // Collect all matches first
+  while ((match = mentionRegex.exec(text)) !== null) {
+    matches.push({
+      fullMatch: match[0],
+      name: match[1].trim(),
+      index: match.index,
+      endIndex: match.index + match[0].length
+    });
+  }
+
+  // If no mentions, return simple text
+  if (matches.length === 0) {
+    return [{
+      type: "paragraph",
+      content: [{ type: "text", text: text }]
+    }];
+  }
+
+  // Build paragraph with mixed text and mentions
+  const paragraphContent = [];
+
+  for (const m of matches) {
+    // Add text before this mention
+    if (m.index > lastIndex) {
+      const beforeText = text.substring(lastIndex, m.index);
+      if (beforeText) {
+        paragraphContent.push({ type: "text", text: beforeText });
+      }
+    }
+
+    // Try to resolve the mention
+    const user = await searchUser(m.name);
+    if (user) {
+      paragraphContent.push({
+        type: "mention",
+        attrs: { id: user.accountId, text: `@${user.displayName}` }
+      });
+    } else {
+      // User not found, keep as plain text
+      paragraphContent.push({ type: "text", text: m.fullMatch });
+    }
+
+    lastIndex = m.endIndex;
+  }
+
+  // Add remaining text after last mention
+  if (lastIndex < text.length) {
+    paragraphContent.push({ type: "text", text: text.substring(lastIndex) });
+  }
+
+  return [{ type: "paragraph", content: paragraphContent }];
+}
+
 // ============ JIRA URL DETECTION ============
 
 function findJiraTicketKeys(text, currentKey = null) {
@@ -905,16 +999,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: result }] };
 
     } else if (name === "jira_add_comment") {
+      // Build ADF content with mention support
+      const adfContent = await buildCommentADF(args.comment);
       const body = {
         body: {
           version: 1,
           type: "doc",
-          content: [
-            {
-              type: "paragraph",
-              content: [{ type: "text", text: args.comment }],
-            },
-          ],
+          content: adfContent,
         },
       };
       const result = await fetchJira(`/issue/${args.issueKey}/comment`, { method: "POST", body });
@@ -971,16 +1062,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Reply to ${originalAuthor}'s comment posted on ${args.issueKey} by ${author} at ${created}.` }] };
 
     } else if (name === "jira_edit_comment") {
+      // Build ADF content with mention support
+      const adfContent = await buildCommentADF(args.comment);
       const body = {
         body: {
           version: 1,
           type: "doc",
-          content: [
-            {
-              type: "paragraph",
-              content: [{ type: "text", text: args.comment }],
-            },
-          ],
+          content: adfContent,
         },
       };
       const result = await fetchJira(`/issue/${args.issueKey}/comment/${args.commentId}`, { method: "PUT", body });
