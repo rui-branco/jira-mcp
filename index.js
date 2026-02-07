@@ -7,7 +7,9 @@ if (process.argv[2] === "setup") {
 }
 
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
-const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
+const {
+  StdioServerTransport,
+} = require("@modelcontextprotocol/sdk/server/stdio.js");
 const {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -15,15 +17,43 @@ const {
 const fs = require("fs");
 const path = require("path");
 const fetch = require("node-fetch");
+const { spawn, execSync } = require("child_process");
+
+// Auto-update
+const PKG_NAME = "@rui.branco/jira-mcp";
+const PKG_VERSION = "1.5.0";
+try {
+  const latest = execSync(`npm view ${PKG_NAME} version`, {
+    stdio: "pipe",
+    timeout: 5000,
+  })
+    .toString()
+    .trim();
+  if (latest && latest !== PKG_VERSION) {
+    const child = spawn("npm", ["install", "-g", `${PKG_NAME}@${latest}`], {
+      stdio: "ignore",
+      detached: true,
+    });
+    child.unref();
+  }
+} catch {}
 
 // Load Jira config
-const jiraConfigPath = path.join(process.env.HOME, ".config/jira-mcp/config.json");
+const jiraConfigPath = path.join(
+  process.env.HOME,
+  ".config/jira-mcp/config.json",
+);
 const jiraConfig = JSON.parse(fs.readFileSync(jiraConfigPath, "utf8"));
-const auth = Buffer.from(`${jiraConfig.email}:${jiraConfig.token}`).toString("base64");
+const auth = Buffer.from(`${jiraConfig.email}:${jiraConfig.token}`).toString(
+  "base64",
+);
 
 // Load Figma config (optional)
 let figmaConfig = null;
-const figmaConfigPath = path.join(process.env.HOME, ".config/figma-mcp/config.json");
+const figmaConfigPath = path.join(
+  process.env.HOME,
+  ".config/figma-mcp/config.json",
+);
 try {
   if (fs.existsSync(figmaConfigPath)) {
     figmaConfig = JSON.parse(fs.readFileSync(figmaConfigPath, "utf8"));
@@ -33,8 +63,14 @@ try {
 }
 
 // Directories
-const attachmentDir = path.join(process.env.HOME, ".config/jira-mcp/attachments");
-const figmaExportsDir = path.join(process.env.HOME, ".config/figma-mcp/exports");
+const attachmentDir = path.join(
+  process.env.HOME,
+  ".config/jira-mcp/attachments",
+);
+const figmaExportsDir = path.join(
+  process.env.HOME,
+  ".config/figma-mcp/exports",
+);
 
 if (!fs.existsSync(attachmentDir)) {
   fs.mkdirSync(attachmentDir, { recursive: true });
@@ -58,7 +94,9 @@ async function fetchJira(endpoint, options = {}) {
   });
   if (!response.ok) {
     const errorBody = await response.text().catch(() => "");
-    throw new Error(`Jira API error: ${response.status} ${response.statusText}${errorBody ? ` - ${errorBody}` : ""}`);
+    throw new Error(
+      `Jira API error: ${response.status} ${response.statusText}${errorBody ? ` - ${errorBody}` : ""}`,
+    );
   }
   const text = await response.text();
   return text ? JSON.parse(text) : {};
@@ -117,7 +155,11 @@ function extractText(content, urls = []) {
         text += `@${node.attrs?.text || "user"}`;
       } else if (node.type === "mediaGroup" || node.type === "mediaSingle") {
         text += "[image attachment]\n";
-      } else if (node.type === "inlineCard" || node.type === "blockCard" || node.type === "embedCard") {
+      } else if (
+        node.type === "inlineCard" ||
+        node.type === "blockCard" ||
+        node.type === "embedCard"
+      ) {
         // Smart links / embeds - extract URL
         const url = node.attrs?.url;
         if (url) {
@@ -154,14 +196,23 @@ async function searchUser(query) {
 
   try {
     // Search for users by display name
-    const users = await fetchJira(`/user/search?query=${encodeURIComponent(query)}&maxResults=5`);
+    const users = await fetchJira(
+      `/user/search?query=${encodeURIComponent(query)}&maxResults=5`,
+    );
     if (users && users.length > 0) {
       // Find best match - prefer exact match, then starts with, then contains
-      const exactMatch = users.find(u => u.displayName.toLowerCase() === query.toLowerCase());
-      const startsWithMatch = users.find(u => u.displayName.toLowerCase().startsWith(query.toLowerCase()));
+      const exactMatch = users.find(
+        (u) => u.displayName.toLowerCase() === query.toLowerCase(),
+      );
+      const startsWithMatch = users.find((u) =>
+        u.displayName.toLowerCase().startsWith(query.toLowerCase()),
+      );
       const user = exactMatch || startsWithMatch || users[0];
 
-      const result = { accountId: user.accountId, displayName: user.displayName };
+      const result = {
+        accountId: user.accountId,
+        displayName: user.displayName,
+      };
       userCache.set(cacheKey, result);
       return result;
     }
@@ -187,16 +238,18 @@ async function buildCommentADF(text) {
       fullMatch: match[0],
       name: match[1].trim(),
       index: match.index,
-      endIndex: match.index + match[0].length
+      endIndex: match.index + match[0].length,
     });
   }
 
   // If no mentions, return simple text
   if (matches.length === 0) {
-    return [{
-      type: "paragraph",
-      content: [{ type: "text", text: text }]
-    }];
+    return [
+      {
+        type: "paragraph",
+        content: [{ type: "text", text: text }],
+      },
+    ];
   }
 
   // Build paragraph with mixed text and mentions
@@ -216,7 +269,7 @@ async function buildCommentADF(text) {
     if (user) {
       paragraphContent.push({
         type: "mention",
-        attrs: { id: user.accountId, text: `@${user.displayName}` }
+        attrs: { id: user.accountId, text: `@${user.displayName}` },
       });
     } else {
       // User not found, keep as plain text
@@ -267,7 +320,8 @@ function findJiraTicketKeys(text, currentKey = null) {
 function findFigmaUrls(text) {
   if (!text) return [];
   // Match Figma URLs
-  const regex = /https:\/\/(?:www\.)?figma\.com\/(?:file|design|proto)\/([a-zA-Z0-9]+)\/[^\s)>\]"']*/g;
+  const regex =
+    /https:\/\/(?:www\.)?figma\.com\/(?:file|design|proto)\/([a-zA-Z0-9]+)\/[^\s)>\]"']*/g;
   const matches = [];
   let match;
   while ((match = regex.exec(text)) !== null) {
@@ -282,7 +336,11 @@ function parseFigmaUrl(url) {
 
   let fileKey = null;
   for (let i = 0; i < pathParts.length; i++) {
-    if (pathParts[i] === "file" || pathParts[i] === "design" || pathParts[i] === "proto") {
+    if (
+      pathParts[i] === "file" ||
+      pathParts[i] === "design" ||
+      pathParts[i] === "proto"
+    ) {
       fileKey = pathParts[i + 1];
       break;
     }
@@ -299,7 +357,11 @@ function parseFigmaUrl(url) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function figmaFetchWithRetry(url, options = {}, { maxRetries = 3, maxWaitSec = 30 } = {}) {
+async function figmaFetchWithRetry(
+  url,
+  options = {},
+  { maxRetries = 3, maxWaitSec = 30 } = {},
+) {
   let attempts = 0;
 
   while (true) {
@@ -317,9 +379,10 @@ async function figmaFetchWithRetry(url, options = {}, { maxRetries = 3, maxWaitS
 
       // Don't retry if wait is too long (monthly limit) or too many attempts
       if (retryAfterSec > maxWaitSec || attempts++ >= maxRetries) {
-        const waitTime = retryAfterSec > 3600
-          ? `${Math.round(retryAfterSec / 3600)} hours (monthly limit reached)`
-          : `${retryAfterSec} seconds`;
+        const waitTime =
+          retryAfterSec > 3600
+            ? `${Math.round(retryAfterSec / 3600)} hours (monthly limit reached)`
+            : `${retryAfterSec} seconds`;
         return { rateLimited: true, retryAfter: waitTime };
       }
 
@@ -333,7 +396,9 @@ async function figmaFetchWithRetry(url, options = {}, { maxRetries = 3, maxWaitS
 
 async function fetchFigmaDesign(url) {
   if (!figmaConfig) {
-    return { error: "Figma not configured. Run: node ~/.config/figma-mcp/setup.js" };
+    return {
+      error: "Figma not configured. Run: node ~/.config/figma-mcp/setup.js",
+    };
   }
 
   const parsed = parseFigmaUrl(url);
@@ -345,14 +410,20 @@ async function fetchFigmaDesign(url) {
 
   try {
     // Get file info
-    const fileRes = await figmaFetchWithRetry(`https://api.figma.com/v1/files/${fileKey}?depth=1`);
+    const fileRes = await figmaFetchWithRetry(
+      `https://api.figma.com/v1/files/${fileKey}?depth=1`,
+    );
 
     if (fileRes.rateLimited) {
-      return { error: `Figma API rate limit exceeded. Try again in ${fileRes.retryAfter} seconds.` };
+      return {
+        error: `Figma API rate limit exceeded. Try again in ${fileRes.retryAfter} seconds.`,
+      };
     }
     if (!fileRes.ok) {
       if (fileRes.status === 403) {
-        return { error: "Figma access denied. Check your token or file permissions." };
+        return {
+          error: "Figma access denied. Check your token or file permissions.",
+        };
       } else if (fileRes.status === 404) {
         return { error: "Figma file not found. Check the URL." };
       }
@@ -377,7 +448,7 @@ async function fetchFigmaDesign(url) {
     if (nodeId) {
       // Get node info with depth=2 to see children
       const nodeRes = await figmaFetchWithRetry(
-        `https://api.figma.com/v1/files/${fileKey}/nodes?ids=${encodeURIComponent(nodeId)}&depth=2`
+        `https://api.figma.com/v1/files/${fileKey}/nodes?ids=${encodeURIComponent(nodeId)}&depth=2`,
       );
 
       if (nodeRes.ok) {
@@ -395,7 +466,12 @@ async function fetchFigmaDesign(url) {
 
           if (doc.children) {
             for (const child of doc.children) {
-              const isExportable = ["FRAME", "COMPONENT", "GROUP", "SECTION"].includes(child.type);
+              const isExportable = [
+                "FRAME",
+                "COMPONENT",
+                "GROUP",
+                "SECTION",
+              ].includes(child.type);
               const cbb = child.absoluteBoundingBox;
               const hasSize = cbb && cbb.width >= 100 && cbb.height >= 100;
               if (isExportable && hasSize) {
@@ -406,11 +482,11 @@ async function fetchFigmaDesign(url) {
 
           // Export children if large frame, otherwise export whole frame
           if (isLarge && exportableChildren.length > 0) {
-            const childIds = exportableChildren.slice(0, 8).map(c => c.id);
+            const childIds = exportableChildren.slice(0, 8).map((c) => c.id);
             const idsParam = childIds.join(",");
 
             const imgRes = await figmaFetchWithRetry(
-              `https://api.figma.com/v1/images/${fileKey}?ids=${encodeURIComponent(idsParam)}&format=png&scale=2`
+              `https://api.figma.com/v1/images/${fileKey}?ids=${encodeURIComponent(idsParam)}&format=png&scale=2`,
             );
 
             if (imgRes.ok) {
@@ -422,25 +498,32 @@ async function fetchFigmaDesign(url) {
                     const downloadRes = await fetch(imageUrl);
                     if (downloadRes.ok) {
                       const buffer = await downloadRes.buffer();
-                      const childInfo = exportableChildren.find(c => c.id === childId);
-                      const sanitizedId = childId.replace(/[^a-zA-Z0-9-]/g, "_");
+                      const childInfo = exportableChildren.find(
+                        (c) => c.id === childId,
+                      );
+                      const sanitizedId = childId.replace(
+                        /[^a-zA-Z0-9-]/g,
+                        "_",
+                      );
                       const filename = `${fileKey}_${sanitizedId}.png`;
                       const imagePath = path.join(figmaExportsDir, filename);
                       fs.writeFileSync(imagePath, buffer);
                       result.images.push({
                         buffer,
                         path: imagePath,
-                        name: childInfo?.name || childId
+                        name: childInfo?.name || childId,
                       });
                     }
-                  } catch (e) { /* skip */ }
+                  } catch (e) {
+                    /* skip */
+                  }
                 }
               }
             }
           } else {
             // Export whole frame
             const imgRes = await figmaFetchWithRetry(
-              `https://api.figma.com/v1/images/${fileKey}?ids=${encodeURIComponent(nodeId)}&format=png&scale=2`
+              `https://api.figma.com/v1/images/${fileKey}?ids=${encodeURIComponent(nodeId)}&format=png&scale=2`,
             );
 
             if (imgRes.ok) {
@@ -454,7 +537,11 @@ async function fetchFigmaDesign(url) {
                   const filename = `${fileKey}_${sanitizedId}.png`;
                   const imagePath = path.join(figmaExportsDir, filename);
                   fs.writeFileSync(imagePath, buffer);
-                  result.images.push({ buffer, path: imagePath, name: doc.name });
+                  result.images.push({
+                    buffer,
+                    path: imagePath,
+                    name: doc.name,
+                  });
                 }
               }
             }
@@ -509,7 +596,9 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
   if (fields.parent) {
     output += `\n## Parent Ticket: ${fields.parent.key}\n\n`;
     try {
-      const parentIssue = await fetchJira(`/issue/${fields.parent.key}?expand=renderedFields`);
+      const parentIssue = await fetchJira(
+        `/issue/${fields.parent.key}?expand=renderedFields`,
+      );
       const pf = parentIssue.fields;
 
       output += `**${pf.summary}**\n`;
@@ -569,7 +658,11 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
 
       if (downloadImages && isImage) {
         try {
-          const localPath = await downloadAttachment(att.content, att.filename, issueKey);
+          const localPath = await downloadAttachment(
+            att.content,
+            att.filename,
+            issueKey,
+          );
           output += `  Local: ${localPath}\n`;
           downloadedImages.push(localPath);
         } catch (e) {
@@ -600,9 +693,10 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
 
         const subtaskDesc = extractText(sf.description, []);
         if (subtaskDesc.text && subtaskDesc.text.trim()) {
-          const desc = subtaskDesc.text.length > 300
-            ? subtaskDesc.text.substring(0, 300) + "..."
-            : subtaskDesc.text;
+          const desc =
+            subtaskDesc.text.length > 300
+              ? subtaskDesc.text.substring(0, 300) + "..."
+              : subtaskDesc.text;
           output += `\n${desc}\n`;
         }
         output += "\n";
@@ -623,14 +717,14 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
         linkedIssues.push({
           key: link.outwardIssue.key,
           relation: link.type.outward,
-          summary: link.outwardIssue.fields?.summary || ""
+          summary: link.outwardIssue.fields?.summary || "",
         });
       }
       if (link.inwardIssue) {
         linkedIssues.push({
           key: link.inwardIssue.key,
           relation: link.type.inward,
-          summary: link.inwardIssue.fields?.summary || ""
+          summary: link.inwardIssue.fields?.summary || "",
         });
       }
     }
@@ -643,7 +737,9 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
       output += `**${linked.summary}**\n\n`;
 
       try {
-        const linkedIssue = await fetchJira(`/issue/${linked.key}?expand=renderedFields`);
+        const linkedIssue = await fetchJira(
+          `/issue/${linked.key}?expand=renderedFields`,
+        );
         const lf = linkedIssue.fields;
 
         output += `Status: ${lf.status?.name || "Unknown"} | `;
@@ -687,26 +783,35 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
   const alreadyFetched = new Set();
   alreadyFetched.add(issueKey);
   if (fields.parent) alreadyFetched.add(fields.parent.key);
-  if (fields.subtasks) fields.subtasks.forEach(s => alreadyFetched.add(s.key));
+  if (fields.subtasks)
+    fields.subtasks.forEach((s) => alreadyFetched.add(s.key));
   if (fields.issuelinks) {
-    fields.issuelinks.forEach(link => {
+    fields.issuelinks.forEach((link) => {
       if (link.outwardIssue) alreadyFetched.add(link.outwardIssue.key);
       if (link.inwardIssue) alreadyFetched.add(link.inwardIssue.key);
     });
   }
 
-  const ticketsToFetch = referencedKeys.filter(key => !alreadyFetched.has(key));
+  const ticketsToFetch = referencedKeys.filter(
+    (key) => !alreadyFetched.has(key),
+  );
 
   if (ticketsToFetch.length > 0) {
     output += `\n## Referenced Tickets (${ticketsToFetch.length})\n\n`;
     output += `_Auto-detected from description/comments_\n\n`;
 
     const maxReferencedToFetch = 10;
-    for (let i = 0; i < Math.min(ticketsToFetch.length, maxReferencedToFetch); i++) {
+    for (
+      let i = 0;
+      i < Math.min(ticketsToFetch.length, maxReferencedToFetch);
+      i++
+    ) {
       const refKey = ticketsToFetch[i];
 
       try {
-        const refIssue = await fetchJira(`/issue/${refKey}?expand=renderedFields`);
+        const refIssue = await fetchJira(
+          `/issue/${refKey}?expand=renderedFields`,
+        );
         const rf = refIssue.fields;
 
         output += `### ${refKey}: ${rf.summary || ""}\n`;
@@ -756,7 +861,9 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
   if (fetchFigma && figmaConfig) {
     // Combine URLs from regex search AND embedded links
     const textUrls = findFigmaUrls(allText);
-    const embeddedFigmaUrls = allUrls.filter(u => u && u.includes("figma.com"));
+    const embeddedFigmaUrls = allUrls.filter(
+      (u) => u && u.includes("figma.com"),
+    );
     const allFigmaUrls = [...new Set([...textUrls, ...embeddedFigmaUrls])]; // dedupe
 
     if (allFigmaUrls.length > 0) {
@@ -790,7 +897,9 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
 }
 
 async function searchTickets(jql, maxResults = 10) {
-  const data = await fetchJira(`/search?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}`);
+  const data = await fetchJira(
+    `/search?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}`,
+  );
 
   let output = `# Search Results (${data.total} total, showing ${data.issues.length})\n\n`;
 
@@ -807,7 +916,7 @@ async function searchTickets(jql, maxResults = 10) {
 
 const server = new Server(
   { name: "jira-mcp", version: "1.0.0" },
-  { capabilities: { tools: {} } }
+  { capabilities: { tools: {} } },
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -815,7 +924,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "jira_get_myself",
-        description: "Get the current authenticated user's info including accountId. Use this to get your account ID for assigning tickets.",
+        description:
+          "Get the current authenticated user's info including accountId. Use this to get your account ID for assigning tickets.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -824,7 +934,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jira_get_ticket",
-        description: "Fetch a Jira ticket by its key (e.g., MODS-12115). Returns full details including description, comments, attachments, and linked Figma designs.",
+        description:
+          "Fetch a Jira ticket by its key (e.g., MODS-12115). Returns full details including description, comments, attachments, and linked Figma designs.",
         inputSchema: {
           type: "object",
           properties: {
@@ -838,7 +949,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             fetchFigma: {
               type: "boolean",
-              description: "Fetch linked Figma designs and export images (default: true)",
+              description:
+                "Fetch linked Figma designs and export images (default: true)",
             },
           },
           required: ["issueKey"],
@@ -846,12 +958,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jira_search",
-        description: "Search Jira tickets using JQL. Examples: 'project = MODS AND status = Open'",
+        description:
+          "Search Jira tickets using JQL. Examples: 'project = MODS AND status = Open'",
         inputSchema: {
           type: "object",
           properties: {
             jql: { type: "string", description: "JQL query string" },
-            maxResults: { type: "number", description: "Max results (default 10)" },
+            maxResults: {
+              type: "number",
+              description: "Max results (default 10)",
+            },
           },
           required: ["jql"],
         },
@@ -862,7 +978,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123)",
+            },
             comment: { type: "string", description: "The comment text to add" },
           },
           required: ["issueKey", "comment"],
@@ -870,12 +989,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jira_reply_comment",
-        description: "Reply to a specific comment on a Jira ticket. Quotes the original comment and mentions the author.",
+        description:
+          "Reply to a specific comment on a Jira ticket. Quotes the original comment and mentions the author.",
         inputSchema: {
           type: "object",
           properties: {
-            issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
-            commentId: { type: "string", description: "The ID of the comment to reply to. Use jira_get_ticket to see comments and their IDs." },
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123)",
+            },
+            commentId: {
+              type: "string",
+              description:
+                "The ID of the comment to reply to. Use jira_get_ticket to see comments and their IDs.",
+            },
             reply: { type: "string", description: "The reply text" },
           },
           required: ["issueKey", "commentId", "reply"],
@@ -883,12 +1010,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jira_edit_comment",
-        description: "Edit an existing comment on a Jira ticket. Replaces the comment text.",
+        description:
+          "Edit an existing comment on a Jira ticket. Replaces the comment text.",
         inputSchema: {
           type: "object",
           properties: {
-            issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
-            commentId: { type: "string", description: "The ID of the comment to edit. Use jira_get_ticket to see comments and their IDs." },
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123)",
+            },
+            commentId: {
+              type: "string",
+              description:
+                "The ID of the comment to edit. Use jira_get_ticket to see comments and their IDs.",
+            },
             comment: { type: "string", description: "The new comment text" },
           },
           required: ["issueKey", "commentId", "comment"],
@@ -896,44 +1031,98 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jira_delete_comment",
-        description: "Delete a comment from a Jira ticket. This action is irreversible.",
+        description:
+          "Delete a comment from a Jira ticket. This action is irreversible.",
         inputSchema: {
           type: "object",
           properties: {
-            issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
-            commentId: { type: "string", description: "The ID of the comment to delete. Use jira_get_ticket to see comments and their IDs." },
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123)",
+            },
+            commentId: {
+              type: "string",
+              description:
+                "The ID of the comment to delete. Use jira_get_ticket to see comments and their IDs.",
+            },
           },
           required: ["issueKey", "commentId"],
         },
       },
       {
         name: "jira_transition",
-        description: "Change the status of a Jira ticket. Use targetStatus to transition by name (auto-handles intermediate steps like In Progress), transitionId for direct transition, or omit both to list available transitions.",
+        description:
+          "Change the status of a Jira ticket. Use targetStatus to transition by name (auto-handles intermediate steps like In Progress), transitionId for direct transition, or omit both to list available transitions.",
         inputSchema: {
           type: "object",
           properties: {
-            issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
-            transitionId: { type: "string", description: "The transition ID to execute. Omit to list available transitions." },
-            targetStatus: { type: "string", description: "Target status name (e.g., 'Review', 'Done'). Will auto-transition through intermediate states if needed." },
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123)",
+            },
+            transitionId: {
+              type: "string",
+              description:
+                "The transition ID to execute. Omit to list available transitions.",
+            },
+            targetStatus: {
+              type: "string",
+              description:
+                "Target status name (e.g., 'Review', 'Done'). Will auto-transition through intermediate states if needed.",
+            },
           },
           required: ["issueKey"],
         },
       },
       {
         name: "jira_update_ticket",
-        description: "Update fields on a Jira ticket. IMPORTANT: Only pass the fields you want to change. Omitted fields are left untouched.",
+        description:
+          "Update fields on a Jira ticket. IMPORTANT: Only pass the fields you want to change. Omitted fields are left untouched.",
         inputSchema: {
           type: "object",
           properties: {
-            issueKey: { type: "string", description: "The Jira issue key (e.g., MODS-123)" },
-            summary: { type: "string", description: "Text to add to the title. By default APPENDS to existing title. Set replaceSummary=true to replace instead." },
-            replaceSummary: { type: "boolean", description: "If true, replaces the entire title. Default is false (append)." },
-            description: { type: "string", description: "Text to add to the description. By default APPENDS to existing content. Set replaceDescription=true to replace instead." },
-            replaceDescription: { type: "boolean", description: "If true, replaces the entire description. Default is false (append)." },
-            removeFromDescription: { type: "string", description: "Text to find and remove from the existing description." },
-            assignee: { type: "string", description: "Assignee account ID (use 'unassigned' to clear)" },
-            priority: { type: "string", description: "Priority name (e.g., High, Medium, Low)" },
-            labels: { type: "array", items: { type: "string" }, description: "Labels to set on the ticket" },
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123)",
+            },
+            summary: {
+              type: "string",
+              description:
+                "Text to add to the title. By default APPENDS to existing title. Set replaceSummary=true to replace instead.",
+            },
+            replaceSummary: {
+              type: "boolean",
+              description:
+                "If true, replaces the entire title. Default is false (append).",
+            },
+            description: {
+              type: "string",
+              description:
+                "Text to add to the description. By default APPENDS to existing content. Set replaceDescription=true to replace instead.",
+            },
+            replaceDescription: {
+              type: "boolean",
+              description:
+                "If true, replaces the entire description. Default is false (append).",
+            },
+            removeFromDescription: {
+              type: "string",
+              description:
+                "Text to find and remove from the existing description.",
+            },
+            assignee: {
+              type: "string",
+              description: "Assignee account ID (use 'unassigned' to clear)",
+            },
+            priority: {
+              type: "string",
+              description: "Priority name (e.g., High, Medium, Low)",
+            },
+            labels: {
+              type: "array",
+              items: { type: "string" },
+              description: "Labels to set on the ticket",
+            },
           },
           required: ["issueKey"],
         },
@@ -949,12 +1138,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === "jira_get_myself") {
       const result = await fetchJira("/myself");
       return {
-        content: [{
-          type: "text",
-          text: `**Account ID:** ${result.accountId}\n**Display Name:** ${result.displayName}\n**Email:** ${result.emailAddress || "N/A"}`
-        }]
+        content: [
+          {
+            type: "text",
+            text: `**Account ID:** ${result.accountId}\n**Display Name:** ${result.displayName}\n**Email:** ${result.emailAddress || "N/A"}`,
+          },
+        ],
       };
-
     } else if (name === "jira_get_ticket") {
       const downloadImages = args.downloadImages !== false;
       const fetchFigma = args.fetchFigma !== false;
@@ -967,15 +1157,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           const imageData = fs.readFileSync(imagePath);
           const ext = path.extname(imagePath).toLowerCase();
-          const mimeType = ext === ".png" ? "image/png" :
-                          ext === ".gif" ? "image/gif" :
-                          ext === ".webp" ? "image/webp" : "image/jpeg";
+          const mimeType =
+            ext === ".png"
+              ? "image/png"
+              : ext === ".gif"
+                ? "image/gif"
+                : ext === ".webp"
+                  ? "image/webp"
+                  : "image/jpeg";
           content.push({
             type: "image",
             data: imageData.toString("base64"),
             mimeType: mimeType,
           });
-        } catch (e) { /* skip */ }
+        } catch (e) {
+          /* skip */
+        }
       }
 
       // Add Figma images (now supports multiple images per design)
@@ -997,7 +1194,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } else if (name === "jira_search") {
       const result = await searchTickets(args.jql, args.maxResults || 10);
       return { content: [{ type: "text", text: result }] };
-
     } else if (name === "jira_add_comment") {
       // Build ADF content with mention support
       const adfContent = await buildCommentADF(args.comment);
@@ -1008,19 +1204,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: adfContent,
         },
       };
-      const result = await fetchJira(`/issue/${args.issueKey}/comment`, { method: "POST", body });
+      const result = await fetchJira(`/issue/${args.issueKey}/comment`, {
+        method: "POST",
+        body,
+      });
       const author = result.author?.displayName || "Unknown";
       const created = new Date(result.created).toLocaleString();
-      return { content: [{ type: "text", text: `Comment added to ${args.issueKey} by ${author} at ${created}.` }] };
-
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Comment added to ${args.issueKey} by ${author} at ${created}.`,
+          },
+        ],
+      };
     } else if (name === "jira_reply_comment") {
       // Fetch the original comment
-      const original = await fetchJira(`/issue/${args.issueKey}/comment/${args.commentId}`);
+      const original = await fetchJira(
+        `/issue/${args.issueKey}/comment/${args.commentId}`,
+      );
       const originalAuthor = original.author?.displayName || "Unknown";
       const originalAccountId = original.author?.accountId;
       const originalText = extractTextSimple(original.body).trim();
       // Truncate quote if too long
-      const quote = originalText.length > 200 ? originalText.substring(0, 200) + "..." : originalText;
+      const quote =
+        originalText.length > 200
+          ? originalText.substring(0, 200) + "..."
+          : originalText;
 
       // Build ADF with mention, quote, and reply
       const replyContent = [];
@@ -1030,7 +1240,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         replyContent.push({
           type: "paragraph",
           content: [
-            { type: "mention", attrs: { id: originalAccountId, text: `@${originalAuthor}` } },
+            {
+              type: "mention",
+              attrs: { id: originalAccountId, text: `@${originalAuthor}` },
+            },
           ],
         });
       }
@@ -1056,11 +1269,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: replyContent,
         },
       };
-      const result = await fetchJira(`/issue/${args.issueKey}/comment`, { method: "POST", body });
+      const result = await fetchJira(`/issue/${args.issueKey}/comment`, {
+        method: "POST",
+        body,
+      });
       const author = result.author?.displayName || "Unknown";
       const created = new Date(result.created).toLocaleString();
-      return { content: [{ type: "text", text: `Reply to ${originalAuthor}'s comment posted on ${args.issueKey} by ${author} at ${created}.` }] };
-
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Reply to ${originalAuthor}'s comment posted on ${args.issueKey} by ${author} at ${created}.`,
+          },
+        ],
+      };
     } else if (name === "jira_edit_comment") {
       // Build ADF content with mention support
       const adfContent = await buildCommentADF(args.comment);
@@ -1071,13 +1293,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: adfContent,
         },
       };
-      const result = await fetchJira(`/issue/${args.issueKey}/comment/${args.commentId}`, { method: "PUT", body });
-      return { content: [{ type: "text", text: `Comment ${args.commentId} on ${args.issueKey} updated.` }] };
-
+      const result = await fetchJira(
+        `/issue/${args.issueKey}/comment/${args.commentId}`,
+        { method: "PUT", body },
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Comment ${args.commentId} on ${args.issueKey} updated.`,
+          },
+        ],
+      };
     } else if (name === "jira_delete_comment") {
-      await fetchJira(`/issue/${args.issueKey}/comment/${args.commentId}`, { method: "DELETE" });
-      return { content: [{ type: "text", text: `Comment ${args.commentId} on ${args.issueKey} deleted.` }] };
-
+      await fetchJira(`/issue/${args.issueKey}/comment/${args.commentId}`, {
+        method: "DELETE",
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Comment ${args.commentId} on ${args.issueKey} deleted.`,
+          },
+        ],
+      };
     } else if (name === "jira_transition") {
       if (!args.transitionId && !args.targetStatus) {
         // List available transitions
@@ -1103,9 +1342,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const available = result.transitions || [];
 
           // Check if target status is directly available
-          const directMatch = available.find(t =>
-            t.to?.name?.toLowerCase() === targetLower ||
-            t.name?.toLowerCase() === targetLower
+          const directMatch = available.find(
+            (t) =>
+              t.to?.name?.toLowerCase() === targetLower ||
+              t.name?.toLowerCase() === targetLower,
           );
 
           if (directMatch) {
@@ -1114,13 +1354,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               body: { transition: { id: directMatch.id } },
             });
             transitions.push(directMatch.to?.name || directMatch.name);
-            return { content: [{ type: "text", text: `Transitioned ${args.issueKey} to ${transitions.join(" → ")}.` }] };
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Transitioned ${args.issueKey} to ${transitions.join(" → ")}.`,
+                },
+              ],
+            };
           }
 
           // Target not available, try "In Progress" as intermediate step
-          const inProgress = available.find(t =>
-            t.to?.name?.toLowerCase() === "in progress" ||
-            t.name?.toLowerCase() === "in progress"
+          const inProgress = available.find(
+            (t) =>
+              t.to?.name?.toLowerCase() === "in progress" ||
+              t.name?.toLowerCase() === "in progress",
           );
 
           if (inProgress) {
@@ -1138,8 +1386,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Could not reach target status
         const result = await fetchJira(`/issue/${args.issueKey}/transitions`);
-        const availableNames = (result.transitions || []).map(t => t.to?.name || t.name).join(", ");
-        return { content: [{ type: "text", text: `Could not transition to "${args.targetStatus}". Available: ${availableNames}` }] };
+        const availableNames = (result.transitions || [])
+          .map((t) => t.to?.name || t.name)
+          .join(", ");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Could not transition to "${args.targetStatus}". Available: ${availableNames}`,
+            },
+          ],
+        };
       }
 
       // Execute transition by ID
@@ -1147,8 +1404,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         method: "POST",
         body: { transition: { id: args.transitionId } },
       });
-      return { content: [{ type: "text", text: `Transition ${args.transitionId} executed on ${args.issueKey}.` }] };
-
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Transition ${args.transitionId} executed on ${args.issueKey}.`,
+          },
+        ],
+      };
     } else if (name === "jira_update_ticket") {
       const fields = {};
       if (args.summary) {
@@ -1156,7 +1419,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           fields.summary = args.summary;
         } else {
           // Append to existing title (default)
-          const issue = await fetchJira(`/issue/${args.issueKey}?fields=summary`);
+          const issue = await fetchJira(
+            `/issue/${args.issueKey}?fields=summary`,
+          );
           const existing = issue.fields?.summary || "";
           fields.summary = existing + " " + args.summary;
         }
@@ -1175,7 +1440,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         } else {
           // Append to existing (default)
-          const issue = await fetchJira(`/issue/${args.issueKey}?fields=description`);
+          const issue = await fetchJira(
+            `/issue/${args.issueKey}?fields=description`,
+          );
           const existing = issue.fields?.description;
           if (existing && existing.content) {
             existing.content.push(newParagraph);
@@ -1190,35 +1457,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
       if (args.removeFromDescription) {
-        const issue = await fetchJira(`/issue/${args.issueKey}?fields=description`);
+        const issue = await fetchJira(
+          `/issue/${args.issueKey}?fields=description`,
+        );
         const existing = issue.fields?.description;
         if (existing && existing.content) {
           // Recursively remove matching text from all text nodes
           function removeText(nodes) {
-            return nodes.map(node => {
-              if (node.type === "text" && node.text) {
-                node.text = node.text.replace(args.removeFromDescription, "");
-              }
-              if (node.content) {
-                node.content = removeText(node.content);
-              }
-              return node;
-            }).filter(node => {
-              // Remove empty text nodes
-              if (node.type === "text" && (!node.text || !node.text.trim())) return false;
-              // Remove empty paragraphs
-              if (node.type === "paragraph" && (!node.content || node.content.length === 0)) return false;
-              return true;
-            });
+            return nodes
+              .map((node) => {
+                if (node.type === "text" && node.text) {
+                  node.text = node.text.replace(args.removeFromDescription, "");
+                }
+                if (node.content) {
+                  node.content = removeText(node.content);
+                }
+                return node;
+              })
+              .filter((node) => {
+                // Remove empty text nodes
+                if (node.type === "text" && (!node.text || !node.text.trim()))
+                  return false;
+                // Remove empty paragraphs
+                if (
+                  node.type === "paragraph" &&
+                  (!node.content || node.content.length === 0)
+                )
+                  return false;
+                return true;
+              });
           }
           existing.content = removeText(existing.content);
           fields.description = existing;
         }
       }
       if (args.assignee) {
-        fields.assignee = args.assignee === "unassigned"
-          ? null
-          : { accountId: args.assignee };
+        fields.assignee =
+          args.assignee === "unassigned" ? null : { accountId: args.assignee };
       }
       if (args.priority) {
         fields.priority = { name: args.priority };
@@ -1228,13 +1503,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       if (Object.keys(fields).length === 0) {
-        return { content: [{ type: "text", text: "No fields provided to update." }] };
+        return {
+          content: [{ type: "text", text: "No fields provided to update." }],
+        };
       }
 
-      await fetchJira(`/issue/${args.issueKey}`, { method: "PUT", body: { fields } });
+      await fetchJira(`/issue/${args.issueKey}`, {
+        method: "PUT",
+        body: { fields },
+      });
       const updated = Object.keys(fields).join(", ");
-      return { content: [{ type: "text", text: `Updated ${args.issueKey}: ${updated}.` }] };
-
+      return {
+        content: [
+          { type: "text", text: `Updated ${args.issueKey}: ${updated}.` },
+        ],
+      };
     } else {
       throw new Error(`Unknown tool: ${name}`);
     }
