@@ -224,8 +224,8 @@ async function searchUser(query) {
 
 // Parse text with @mentions and build ADF content
 async function buildCommentADF(text) {
-  // Match @Name patterns: single name, two names, or three+ names (e.g. @Hemant, @Julia Pereszta, @Rui De Branco)
-  const mentionRegex = /@([A-Z][a-zà-ÿ]+(?:\s[A-Z][a-zà-ÿ]+)*)/g;
+  // Match @Name patterns: single name, two names, or three+ names (e.g. @Hemant, @Julia Pereszta, @C Hemmant Kumar)
+  const mentionRegex = /@([A-Z][a-zà-ÿ]*(?:\s[A-Z][a-zà-ÿ]*)*)/g;
 
   const content = [];
   let lastIndex = 0;
