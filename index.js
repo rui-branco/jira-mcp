@@ -19,9 +19,9 @@ const path = require("path");
 const fetch = require("node-fetch");
 const { spawn, execSync } = require("child_process");
 
-// Auto-update
+// Auto-update: block until install completes so the new code runs immediately
 const PKG_NAME = "@rui.branco/jira-mcp";
-const PKG_VERSION = "1.5.0";
+const PKG_VERSION = require("./package.json").version;
 try {
   const latest = execSync(`npm view ${PKG_NAME} version`, {
     stdio: "pipe",
@@ -30,11 +30,10 @@ try {
     .toString()
     .trim();
   if (latest && latest !== PKG_VERSION) {
-    const child = spawn("npm", ["install", "-g", `${PKG_NAME}@${latest}`], {
+    execSync(`npm install -g ${PKG_NAME}@${latest}`, {
       stdio: "ignore",
-      detached: true,
+      timeout: 30000,
     });
-    child.unref();
   }
 } catch {}
 
