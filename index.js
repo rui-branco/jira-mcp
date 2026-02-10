@@ -224,8 +224,8 @@ async function searchUser(query) {
 
 // Parse text with @mentions and build ADF content
 async function buildCommentADF(text) {
-  // Match @FirstName LastName pattern (2 capitalized words)
-  const mentionRegex = /@([A-Z][a-z]+\s[A-Z][a-z]+)/g;
+  // Match @Name patterns: single name, two names, or three+ names (e.g. @Hemant, @Julia Pereszta, @Rui De Branco)
+  const mentionRegex = /@([A-Z][a-zà-ÿ]+(?:\s[A-Z][a-zà-ÿ]+)*)/g;
 
   const content = [];
   let lastIndex = 0;
@@ -1127,6 +1127,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["issueKey"],
         },
       },
+      {
+        name: "jira_search_users",
+        description:
+          "Search for Jira users by name or email. Returns account IDs and display names. Use this to find users for mentions or assignments.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description:
+                "Search query - name or email (e.g., 'Julia', 'hemant', 'rui.branco@kone.com')",
+            },
+            maxResults: {
+              type: "number",
+              description: "Max results (default 5)",
+            },
+          },
+          required: ["query"],
+        },
+      },
     ],
   };
 });
@@ -1142,6 +1162,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           {
             type: "text",
             text: `**Account ID:** ${result.accountId}\n**Display Name:** ${result.displayName}\n**Email:** ${result.emailAddress || "N/A"}`,
+          },
+        ],
+      };
+    } else if (name === "jira_search_users") {
+      const maxResults = args.maxResults || 5;
+      const users = await fetchJira(
+        `/user/search?query=${encodeURIComponent(args.query)}&maxResults=${maxResults}`,
+      );
+      if (!users || users.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No users found for "${args.query}".`,
+            },
+          ],
+        };
+      }
+      const lines = users.map(
+        (u) =>
+          `- **${u.displayName}** (accountId: ${u.accountId}${u.emailAddress ? `, email: ${u.emailAddress}` : ""})`,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Found ${users.length} user(s) for "${args.query}":\n\n${lines.join("\n")}`,
           },
         ],
       };
