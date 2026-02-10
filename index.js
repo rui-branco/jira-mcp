@@ -223,68 +223,89 @@ async function searchUser(query) {
 }
 
 // Parse text with @mentions and build ADF content
-async function buildCommentADF(text) {
-  // Match @Name patterns: single name, two names, or three+ names (e.g. @Hemant, @Julia Pereszta, @C Hemmant Kumar, @Divyarani GS)
-  const mentionRegex = /@([A-Z][a-zA-Zà-ÿ]*(?:\s[A-Z][a-zA-Zà-ÿ]*)*)/g;
+// Parse inline formatting: **bold**, *italic*, @mentions
+async function parseInlineFormatting(text) {
+  const nodes = [];
+  // Bold (**) must come before italic (*) in alternation
+  const regex = /(\*\*(.+?)\*\*|\*(.+?)\*|@([A-Z][a-zA-Zà-ÿ]*(?:\s[A-Z][a-zA-Zà-ÿ]*)*))/g;
 
-  const content = [];
   let lastIndex = 0;
   let match;
-  const matches = [];
 
-  // Collect all matches first
-  while ((match = mentionRegex.exec(text)) !== null) {
-    matches.push({
-      fullMatch: match[0],
-      name: match[1].trim(),
-      index: match.index,
-      endIndex: match.index + match[0].length,
-    });
-  }
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push({ type: "text", text: text.substring(lastIndex, match.index) });
+    }
 
-  // If no mentions, return simple text
-  if (matches.length === 0) {
-    return [
-      {
-        type: "paragraph",
-        content: [{ type: "text", text: text }],
-      },
-    ];
-  }
-
-  // Build paragraph with mixed text and mentions
-  const paragraphContent = [];
-
-  for (const m of matches) {
-    // Add text before this mention
-    if (m.index > lastIndex) {
-      const beforeText = text.substring(lastIndex, m.index);
-      if (beforeText) {
-        paragraphContent.push({ type: "text", text: beforeText });
+    if (match[2] !== undefined) {
+      // **bold**
+      nodes.push({ type: "text", text: match[2], marks: [{ type: "strong" }] });
+    } else if (match[3] !== undefined) {
+      // *italic*
+      nodes.push({ type: "text", text: match[3], marks: [{ type: "em" }] });
+    } else if (match[4] !== undefined) {
+      // @Mention
+      const user = await searchUser(match[4].trim());
+      if (user) {
+        nodes.push({
+          type: "mention",
+          attrs: { id: user.accountId, text: `@${user.displayName}` },
+        });
+      } else {
+        nodes.push({ type: "text", text: match[0] });
       }
     }
 
-    // Try to resolve the mention
-    const user = await searchUser(m.name);
-    if (user) {
-      paragraphContent.push({
-        type: "mention",
-        attrs: { id: user.accountId, text: `@${user.displayName}` },
-      });
-    } else {
-      // User not found, keep as plain text
-      paragraphContent.push({ type: "text", text: m.fullMatch });
-    }
-
-    lastIndex = m.endIndex;
+    lastIndex = match.index + match[0].length;
   }
 
-  // Add remaining text after last mention
   if (lastIndex < text.length) {
-    paragraphContent.push({ type: "text", text: text.substring(lastIndex) });
+    nodes.push({ type: "text", text: text.substring(lastIndex) });
   }
 
-  return [{ type: "paragraph", content: paragraphContent }];
+  return nodes.length > 0 ? nodes : [{ type: "text", text: text }];
+}
+
+// Parse text with markdown formatting and @mentions, build ADF content
+async function buildCommentADF(text) {
+  // Split into blocks by double newlines (paragraphs)
+  const blocks = text.split(/\n\n+/);
+  const content = [];
+
+  for (const block of blocks) {
+    const trimmed = block.trim();
+    if (!trimmed) continue;
+
+    const lines = trimmed.split("\n");
+    const isBulletList = lines.every((l) => l.trimStart().startsWith("- "));
+
+    if (isBulletList) {
+      // Bullet list block
+      const listItems = [];
+      for (const line of lines) {
+        const itemText = line.trimStart().substring(2);
+        const inlineContent = await parseInlineFormatting(itemText);
+        listItems.push({
+          type: "listItem",
+          content: [{ type: "paragraph", content: inlineContent }],
+        });
+      }
+      content.push({ type: "bulletList", content: listItems });
+    } else {
+      // Regular paragraph — single newlines become hardBreaks
+      const paragraphContent = [];
+      for (let i = 0; i < lines.length; i++) {
+        if (i > 0) paragraphContent.push({ type: "hardBreak" });
+        const inlineNodes = await parseInlineFormatting(lines[i]);
+        paragraphContent.push(...inlineNodes);
+      }
+      content.push({ type: "paragraph", content: paragraphContent });
+    }
+  }
+
+  return content.length > 0
+    ? content
+    : [{ type: "paragraph", content: [{ type: "text", text: text }] }];
 }
 
 // ============ JIRA URL DETECTION ============
