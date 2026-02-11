@@ -1,6 +1,6 @@
 {
   "name": "@rui.branco/jira-mcp",
-  "version": "1.6.4",
+  "version": "1.6.5",
   "description": "Jira MCP server for Claude Code - fetch tickets, search with JQL, update tickets, manage comments, change status, and get Figma designs",
   "main": "index.js",
   "bin": {
