@@ -994,7 +994,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "jira_add_comment",
-        description: "Add a comment to a Jira ticket.",
+        description:
+          "Add a comment to a Jira ticket. IMPORTANT: Use @DisplayName (e.g. @Julia Pereszta) for mentions — NOT [~accountId:...] syntax. Keep comments non-technical and user-facing. Never mention git details like 'pushed to main', branch names, or technical implementation details — stakeholders don't care about that.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1031,7 +1032,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_edit_comment",
         description:
-          "Edit an existing comment on a Jira ticket. Replaces the comment text.",
+          "Edit an existing comment on a Jira ticket. Replaces the comment text. IMPORTANT: Use @DisplayName (e.g. @Julia Pereszta) for mentions — NOT [~accountId:...] syntax. Keep comments non-technical and user-facing. Never mention git details like 'pushed to main', branch names, or technical implementation details.",
         inputSchema: {
           type: "object",
           properties: {
