@@ -225,8 +225,8 @@ async function searchUser(query) {
 // Parse inline formatting: **bold**, *italic*, @mentions
 async function parseInlineFormatting(text) {
   const nodes = [];
-  // Bold (**) must come before italic (*) in alternation
-  const regex = /(\*\*(.+?)\*\*|\*(.+?)\*|@([A-Z][a-zA-Zà-ÿ]*(?:\s[A-Z][a-zA-Zà-ÿ]*)*))/g;
+  // Bold (**) must come before italic (*) in alternation, backticks for inline code
+  const regex = /(`(.+?)`|\*\*(.+?)\*\*|\*(.+?)\*|@([A-Z][a-zA-Zà-ÿ]*(?:\s[A-Z][a-zA-Zà-ÿ]*)*))/g;
 
   let lastIndex = 0;
   let match;
@@ -237,14 +237,17 @@ async function parseInlineFormatting(text) {
     }
 
     if (match[2] !== undefined) {
-      // **bold**
-      nodes.push({ type: "text", text: match[2], marks: [{ type: "strong" }] });
+      // `inline code`
+      nodes.push({ type: "text", text: match[2], marks: [{ type: "code" }] });
     } else if (match[3] !== undefined) {
-      // *italic*
-      nodes.push({ type: "text", text: match[3], marks: [{ type: "em" }] });
+      // **bold**
+      nodes.push({ type: "text", text: match[3], marks: [{ type: "strong" }] });
     } else if (match[4] !== undefined) {
+      // *italic*
+      nodes.push({ type: "text", text: match[4], marks: [{ type: "em" }] });
+    } else if (match[5] !== undefined) {
       // @Mention
-      const user = await searchUser(match[4].trim());
+      const user = await searchUser(match[5].trim());
       if (user) {
         nodes.push({
           type: "mention",
