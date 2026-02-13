@@ -921,7 +921,7 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
 
 async function searchTickets(jql, maxResults = 10) {
   const data = await fetchJira(
-    `/search?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}`,
+    `/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}`,
   );
 
   let output = `# Search Results (${data.total} total, showing ${data.issues.length})\n\n`;
