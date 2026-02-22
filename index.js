@@ -19,21 +19,30 @@ const path = require("path");
 const fetch = require("node-fetch");
 const { spawn, execSync } = require("child_process");
 
-// Auto-update: block until install completes so the new code runs immediately
-const PKG_NAME = "@rui.branco/jira-mcp";
-const PKG_VERSION = require("./package.json").version;
+// Auto-update: check GitHub for new commits, install in background
+const GITHUB_REPO = "rui-branco/jira-mcp";
+const INSTALLED_SHA_FILE = path.join(__dirname, ".installed-sha");
 try {
-  const latest = execSync(`npm view ${PKG_NAME} version`, {
-    stdio: "pipe",
-    timeout: 5000,
-  })
+  const localSha = fs.existsSync(INSTALLED_SHA_FILE)
+    ? fs.readFileSync(INSTALLED_SHA_FILE, "utf-8").trim()
+    : "";
+  const remoteSha = execSync(
+    `git ls-remote https://github.com/${GITHUB_REPO}.git HEAD`,
+    { stdio: "pipe", timeout: 5000 },
+  )
     .toString()
+    .split("\t")[0]
     .trim();
-  if (latest && latest !== PKG_VERSION) {
-    execSync(`npm install -g ${PKG_NAME}@${latest}`, {
-      stdio: "ignore",
-      timeout: 30000,
-    });
+  if (remoteSha && remoteSha !== localSha) {
+    const child = spawn(
+      "sh",
+      [
+        "-c",
+        `npm install -g git+ssh://git@github.com/${GITHUB_REPO}.git && echo "${remoteSha}" > "${INSTALLED_SHA_FILE}"`,
+      ],
+      { stdio: "ignore", detached: true },
+    );
+    child.unref();
   }
 } catch {}
 
