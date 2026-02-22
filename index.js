@@ -921,15 +921,16 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
 
 async function searchTickets(jql, maxResults = 10) {
   const data = await fetchJira(
-    `/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}`,
+    `/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}&fields=summary,status,assignee`,
   );
 
-  let output = `# Search Results (${data.total} total, showing ${data.issues.length})\n\n`;
+  const issues = data.issues || [];
+  let output = `# Search Results (${data.total || 0} total, showing ${issues.length})\n\n`;
 
-  for (const issue of data.issues) {
-    const f = issue.fields;
-    output += `- **${issue.key}**: ${f.summary}\n`;
-    output += `  Status: ${f.status?.name} | Assignee: ${f.assignee?.displayName || "Unassigned"}\n\n`;
+  for (const issue of issues) {
+    const f = issue.fields || {};
+    output += `- **${issue.key}**: ${f.summary || "No summary"}\n`;
+    output += `  Status: ${f.status?.name || "Unknown"} | Assignee: ${f.assignee?.displayName || "Unassigned"}\n\n`;
   }
 
   return output;
