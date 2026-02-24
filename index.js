@@ -279,6 +279,8 @@ async function parseInlineFormatting(text) {
 
 // Parse text with markdown formatting and @mentions, build ADF content
 async function buildCommentADF(text) {
+  // Sanitize: replace em dashes and en dashes with hyphen
+  text = text.replace(/[—–]/g, "-");
   // Split into blocks by double newlines (paragraphs)
   const blocks = text.split(/\n\n+/);
   const content = [];
@@ -1008,7 +1010,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_add_comment",
         description:
-          "Add a comment to a Jira ticket. IMPORTANT: Use @DisplayName (e.g. @Julia Pereszta) for mentions — NOT [~accountId:...] syntax. Keep comments non-technical and user-facing. Never mention git details like 'pushed to main', branch names, or technical implementation details — stakeholders don't care about that.",
+          "Add a comment to a Jira ticket. IMPORTANT: Use @DisplayName (e.g. @Julia Pereszta) for mentions — NOT [~accountId:...] syntax. Keep comments non-technical and user-facing. Never mention git details like 'pushed to main', branch names, or technical implementation details — stakeholders don't care about that. NEVER use em dashes (—) or en dashes (–) in comments — use commas, periods, or rewrite the sentence instead.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1111,7 +1113,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_update_ticket",
         description:
-          "Update fields on a Jira ticket. IMPORTANT: Only pass the fields you want to change. Omitted fields are left untouched.",
+          "Update fields on a Jira ticket. IMPORTANT: Only pass the fields you want to change. Omitted fields are left untouched. NEVER use em dashes (—) or en dashes (–) in text — use commas, periods, or rewrite the sentence instead.",
         inputSchema: {
           type: "object",
           properties: {
