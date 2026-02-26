@@ -595,6 +595,7 @@ async function fetchFigmaDesign(url) {
 async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
   const issue = await fetchJira(`/issue/${issueKey}?expand=renderedFields`);
   const fields = issue.fields;
+  const storyPoints = fields.customfield_10016 ?? fields.story_points ?? null;
 
   let output = `# ${issueKey}: ${fields.summary}\n\n`;
   output += `**Status:** ${fields.status?.name || "Unknown"}\n`;
@@ -603,12 +604,31 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
   output += `**Assignee:** ${fields.assignee?.displayName || "Unassigned"}\n`;
   output += `**Reporter:** ${fields.reporter?.displayName || "Unknown"}\n`;
 
+  // Date fields
+  if (fields.created) output += `**Created:** ${fields.created}\n`;
+  if (fields.updated) output += `**Updated:** ${fields.updated}\n`;
+  if (fields.resolutiondate) output += `**Resolved:** ${fields.resolutiondate}\n`;
+  if (fields.resolution) output += `**Resolution:** ${fields.resolution.name}\n`;
+
+  // Story points
+  if (storyPoints != null) output += `**Story Points:** ${storyPoints}\n`;
+
   if (fields.sprint) {
     output += `**Sprint:** ${fields.sprint.name}\n`;
   }
 
   if (fields.parent) {
     output += `**Parent:** ${fields.parent.key} - ${fields.parent.fields?.summary || ""}\n`;
+  }
+
+  // Labels, Components, Fix Versions
+  if (fields.labels?.length > 0) output += `**Labels:** ${fields.labels.join(", ")}\n`;
+  if (fields.components?.length > 0) output += `**Components:** ${fields.components.map(c => c.name).join(", ")}\n`;
+  if (fields.fixVersions?.length > 0) output += `**Fix Versions:** ${fields.fixVersions.map(v => v.name).join(", ")}\n`;
+
+  // Time tracking
+  if (fields.timetracking && (fields.timetracking.originalEstimate || fields.timetracking.timeSpent)) {
+    output += `**Time Tracking:** estimate=${fields.timetracking.originalEstimate || "none"}, spent=${fields.timetracking.timeSpent || "none"}, remaining=${fields.timetracking.remainingEstimate || "none"}\n`;
   }
 
   // Subtasks
@@ -930,9 +950,17 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
   return { text: output, jiraImages: downloadedImages, figmaDesigns };
 }
 
-async function searchTickets(jql, maxResults = 10) {
+async function searchTickets(jql, maxResults = 10, fields = null) {
+  const defaultFields = [
+    "summary", "status", "assignee", "reporter", "issuetype", "priority",
+    "created", "resolutiondate", "updated", "statuscategorychangedate",
+    "resolution", "timetracking", "aggregatetimeoriginalestimate",
+    "aggregatetimespent", "parent", "labels", "components", "fixVersions",
+    "customfield_10016", // story points (Jira Software)
+  ];
+  const requestFields = fields || defaultFields;
   const data = await fetchJira(
-    `/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}&fields=summary,status,assignee`,
+    `/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}&fields=${requestFields.join(",")}`,
   );
 
   const issues = data.issues || [];
@@ -940,8 +968,184 @@ async function searchTickets(jql, maxResults = 10) {
 
   for (const issue of issues) {
     const f = issue.fields || {};
+    const storyPoints = f.customfield_10016 ?? f.story_points ?? null;
+
     output += `- **${issue.key}**: ${f.summary || "No summary"}\n`;
-    output += `  Status: ${f.status?.name || "Unknown"} | Assignee: ${f.assignee?.displayName || "Unassigned"}\n\n`;
+    output += `  Status: ${f.status?.name || "Unknown"} | Type: ${f.issuetype?.name || "Unknown"} | Priority: ${f.priority?.name || "None"}\n`;
+    output += `  Assignee: ${f.assignee?.displayName || "Unassigned"} | Reporter: ${f.reporter?.displayName || "Unknown"}\n`;
+
+    if (f.created) output += `  Created: ${f.created}\n`;
+    if (f.updated) output += `  Updated: ${f.updated}\n`;
+    if (f.resolutiondate) output += `  Resolved: ${f.resolutiondate}\n`;
+    if (f.resolution) output += `  Resolution: ${f.resolution.name}\n`;
+    if (storyPoints != null) output += `  Story Points: ${storyPoints}\n`;
+    if (f.parent) output += `  Parent: ${f.parent.key}${f.parent.fields?.summary ? ` - ${f.parent.fields.summary}` : ""}\n`;
+    if (f.labels?.length > 0) output += `  Labels: ${f.labels.join(", ")}\n`;
+    if (f.components?.length > 0) output += `  Components: ${f.components.map(c => c.name).join(", ")}\n`;
+    if (f.fixVersions?.length > 0) output += `  Fix Versions: ${f.fixVersions.map(v => v.name).join(", ")}\n`;
+    if (f.timetracking && (f.timetracking.originalEstimate || f.timetracking.timeSpent)) {
+      output += `  Time Tracking: estimate=${f.timetracking.originalEstimate || "none"}, spent=${f.timetracking.timeSpent || "none"}, remaining=${f.timetracking.remainingEstimate || "none"}\n`;
+    }
+
+    output += "\n";
+  }
+
+  return output;
+}
+
+// ============ CHANGELOG FUNCTIONS ============
+
+function parseStatusHistory(changelog) {
+  const statusChanges = [];
+  if (!changelog?.histories) return statusChanges;
+
+  for (const history of changelog.histories) {
+    for (const item of history.items || []) {
+      if (item.field === "status") {
+        statusChanges.push({
+          from: item.fromString,
+          to: item.toString,
+          date: history.created,
+          author: history.author?.displayName || "Unknown",
+        });
+      }
+    }
+  }
+
+  // Sort chronologically
+  statusChanges.sort((a, b) => new Date(a.date) - new Date(b.date));
+  return statusChanges;
+}
+
+function computeMetrics(statusHistory, created) {
+  if (!statusHistory.length) return null;
+
+  const metrics = {
+    cycleTime: null,
+    leadTime: null,
+    timesInProgress: 0,
+    timeInStatus: {},
+  };
+
+  // Build timeline: start with created date in the initial status
+  const timeline = [];
+  if (created && statusHistory.length > 0) {
+    timeline.push({ status: statusHistory[0].from, date: new Date(created) });
+  }
+  for (const change of statusHistory) {
+    timeline.push({ status: change.to, date: new Date(change.date) });
+  }
+
+  // Calculate time in each status
+  for (let i = 0; i < timeline.length - 1; i++) {
+    const status = timeline[i].status;
+    const duration = timeline[i + 1].date - timeline[i].date;
+    metrics.timeInStatus[status] = (metrics.timeInStatus[status] || 0) + duration;
+  }
+  // Add current status (time since last transition)
+  const last = timeline[timeline.length - 1];
+  const sinceLastTransition = Date.now() - last.date;
+  metrics.timeInStatus[last.status] = (metrics.timeInStatus[last.status] || 0) + sinceLastTransition;
+
+  // Count times in progress-like statuses
+  metrics.timesInProgress = statusHistory.filter(
+    (c) => c.to.toLowerCase().includes("progress"),
+  ).length;
+
+  // Cycle time: first "In Progress" to last "Done"
+  const firstInProgress = statusHistory.find(
+    (c) => c.to.toLowerCase().includes("progress"),
+  );
+  const lastDone = [...statusHistory].reverse().find(
+    (c) => c.to.toLowerCase() === "done" || c.to.toLowerCase() === "closed",
+  );
+  if (firstInProgress && lastDone) {
+    metrics.cycleTime = new Date(lastDone.date) - new Date(firstInProgress.date);
+  }
+
+  // Lead time: created to done
+  if (created && lastDone) {
+    metrics.leadTime = new Date(lastDone.date) - new Date(created);
+  }
+
+  // Format durations
+  const fmt = (ms) => {
+    if (ms == null) return null;
+    const totalMinutes = Math.floor(ms / 60000);
+    const days = Math.floor(totalMinutes / (60 * 24));
+    const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+    const minutes = totalMinutes % 60;
+    const parts = [];
+    if (days > 0) parts.push(`${days}d`);
+    if (hours > 0) parts.push(`${hours}h`);
+    parts.push(`${minutes}m`);
+    return parts.join(" ");
+  };
+
+  return {
+    cycleTime: fmt(metrics.cycleTime),
+    leadTime: fmt(metrics.leadTime),
+    timesInProgress: metrics.timesInProgress,
+    timeInStatus: Object.fromEntries(
+      Object.entries(metrics.timeInStatus).map(([k, v]) => [k, fmt(v)]),
+    ),
+  };
+}
+
+function formatChangelog(issueKey, statusHistory, created) {
+  let output = `## Status History for ${issueKey}\n\n`;
+
+  if (statusHistory.length === 0) {
+    output += "_No status transitions found._\n";
+    return output;
+  }
+
+  for (const change of statusHistory) {
+    const date = new Date(change.date).toLocaleString();
+    output += `- **${change.from}** → **${change.to}** (${date}, by ${change.author})\n`;
+  }
+
+  const computed = computeMetrics(statusHistory, created);
+  if (computed) {
+    output += `\n### Computed Metrics\n\n`;
+    if (computed.cycleTime) output += `- **Cycle Time:** ${computed.cycleTime}\n`;
+    if (computed.leadTime) output += `- **Lead Time:** ${computed.leadTime}\n`;
+    output += `- **Times In Progress:** ${computed.timesInProgress}\n`;
+    if (Object.keys(computed.timeInStatus).length > 0) {
+      output += `- **Time in Status:**\n`;
+      for (const [status, time] of Object.entries(computed.timeInStatus)) {
+        output += `  - ${status}: ${time}\n`;
+      }
+    }
+  }
+
+  return output;
+}
+
+async function getChangelog(issueKey) {
+  const issue = await fetchJira(`/issue/${issueKey}?expand=changelog&fields=created`);
+  const statusHistory = parseStatusHistory(issue.changelog);
+  const created = issue.fields?.created;
+  return { statusHistory, created, formatted: formatChangelog(issueKey, statusHistory, created) };
+}
+
+async function getChangelogsBulk(jql, maxResults = 50) {
+  // First get the issue keys matching the JQL
+  const data = await fetchJira(
+    `/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}&fields=key,created`,
+  );
+  const issues = data.issues || [];
+
+  let output = `# Changelogs (${issues.length} of ${data.total || 0} issues)\n\n`;
+
+  // Fetch changelog for each issue (JIRA search API doesn't support expand=changelog on /search/jql)
+  for (const issue of issues) {
+    try {
+      const result = await getChangelog(issue.key);
+      output += result.formatted + "\n";
+    } catch (e) {
+      output += `## ${issue.key}\n\n_Error fetching changelog: ${e.message}_\n\n`;
+    }
   }
 
   return output;
@@ -994,7 +1198,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_search",
         description:
-          "Search Jira tickets using JQL. Examples: 'project = MODS AND status = Open'",
+          "Search Jira tickets using JQL. Returns detailed fields including dates, story points, labels, components, fix versions, time tracking, and parent. Examples: 'project = MODS AND status = Open'",
         inputSchema: {
           type: "object",
           properties: {
@@ -1002,6 +1206,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             maxResults: {
               type: "number",
               description: "Max results (default 10)",
+            },
+            fields: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Custom list of fields to return. Default includes: summary, status, assignee, reporter, issuetype, priority, created, resolutiondate, updated, resolution, timetracking, parent, labels, components, fixVersions, customfield_10016 (story points).",
             },
           },
           required: ["jql"],
@@ -1183,6 +1393,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["query"],
         },
       },
+      {
+        name: "jira_get_changelog",
+        description:
+          "Get status change history for a Jira ticket or multiple tickets via JQL. Returns all status transitions with timestamps and authors, plus computed metrics (cycle time, lead time, time in each status). Use issueKey for a single ticket, or jql for bulk retrieval.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: {
+              type: "string",
+              description:
+                "Single issue key (e.g., MODS-13996). Use this OR jql, not both.",
+            },
+            jql: {
+              type: "string",
+              description:
+                "JQL query to get changelogs for multiple tickets (e.g., 'project = MODS AND sprint = 123'). Use this OR issueKey, not both.",
+            },
+            maxResults: {
+              type: "number",
+              description:
+                "Max results when using jql (default 50). Each ticket requires a separate API call, so keep this reasonable.",
+            },
+          },
+          required: [],
+        },
+      },
     ],
   };
 });
@@ -1275,7 +1511,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       return { content };
     } else if (name === "jira_search") {
-      const result = await searchTickets(args.jql, args.maxResults || 10);
+      const result = await searchTickets(args.jql, args.maxResults || 10, args.fields || null);
       return { content: [{ type: "text", text: result }] };
     } else if (name === "jira_add_comment") {
       // Build ADF content with mention support
@@ -1601,6 +1837,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           { type: "text", text: `Updated ${args.issueKey}: ${updated}.` },
         ],
       };
+    } else if (name === "jira_get_changelog") {
+      if (!args.issueKey && !args.jql) {
+        return {
+          content: [{ type: "text", text: "Error: Provide either issueKey or jql parameter." }],
+          isError: true,
+        };
+      }
+      if (args.issueKey) {
+        const result = await getChangelog(args.issueKey);
+        return { content: [{ type: "text", text: result.formatted }] };
+      } else {
+        const result = await getChangelogsBulk(args.jql, args.maxResults || 50);
+        return { content: [{ type: "text", text: result }] };
+      }
     } else {
       throw new Error(`Unknown tool: ${name}`);
     }
