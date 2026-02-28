@@ -46,15 +46,65 @@ try {
   }
 } catch {}
 
-// Load Jira config
+// Load Jira config (supports single-instance and multi-instance formats)
 const jiraConfigPath = path.join(
   process.env.HOME,
   ".config/jira-mcp/config.json",
 );
-const jiraConfig = JSON.parse(fs.readFileSync(jiraConfigPath, "utf8"));
-const auth = Buffer.from(`${jiraConfig.email}:${jiraConfig.token}`).toString(
-  "base64",
-);
+const rawConfig = JSON.parse(fs.readFileSync(jiraConfigPath, "utf8"));
+
+// Normalize config to multi-instance format
+let instances;
+if (rawConfig.instances) {
+  // New multi-instance format
+  instances = rawConfig.instances.map((inst) => ({
+    ...inst,
+    projects: (inst.projects || []).map((p) => p.toUpperCase()),
+    auth: Buffer.from(`${inst.email}:${inst.token}`).toString("base64"),
+  }));
+} else {
+  // Old single-instance format — wrap as array
+  instances = [
+    {
+      name: "default",
+      email: rawConfig.email,
+      token: rawConfig.token,
+      baseUrl: rawConfig.baseUrl,
+      projects: [],
+      auth: Buffer.from(`${rawConfig.email}:${rawConfig.token}`).toString("base64"),
+    },
+  ];
+}
+
+// Resolve default instance
+const defaultInstance =
+  (rawConfig.defaultInstance && instances.find((i) => i.name === rawConfig.defaultInstance)) ||
+  instances[0];
+
+// Re-read config file (for persisting changes)
+function loadConfigFile() {
+  try {
+    return JSON.parse(fs.readFileSync(jiraConfigPath, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+// Instance resolution helpers
+function getInstanceForProject(projectPrefix) {
+  const upper = projectPrefix.toUpperCase();
+  return instances.find((i) => i.projects.includes(upper)) || defaultInstance;
+}
+
+function getInstanceForKey(issueKey) {
+  const prefix = issueKey.split("-")[0];
+  return getInstanceForProject(prefix);
+}
+
+function getInstanceByName(name) {
+  if (!name) return defaultInstance;
+  return instances.find((i) => i.name === name) || defaultInstance;
+}
 
 // Load Figma config (optional)
 let figmaConfig = null;
@@ -86,16 +136,16 @@ if (!fs.existsSync(attachmentDir)) {
 
 // ============ JIRA FUNCTIONS ============
 
-async function fetchJira(endpoint, options = {}) {
+async function fetchJira(endpoint, options = {}, instance = defaultInstance) {
   const { method = "GET", body } = options;
   const headers = {
-    Authorization: `Basic ${auth}`,
+    Authorization: `Basic ${instance.auth}`,
     Accept: "application/json",
   };
   if (body) {
     headers["Content-Type"] = "application/json";
   }
-  const response = await fetch(`${jiraConfig.baseUrl}/rest/api/3${endpoint}`, {
+  const response = await fetch(`${instance.baseUrl}/rest/api/3${endpoint}`, {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
@@ -110,7 +160,7 @@ async function fetchJira(endpoint, options = {}) {
   return text ? JSON.parse(text) : {};
 }
 
-async function downloadAttachment(url, filename, issueKey) {
+async function downloadAttachment(url, filename, issueKey, instance) {
   const issueDir = path.join(attachmentDir, issueKey);
   if (!fs.existsSync(issueDir)) {
     fs.mkdirSync(issueDir, { recursive: true });
@@ -122,8 +172,9 @@ async function downloadAttachment(url, filename, issueKey) {
     return localPath;
   }
 
+  const inst = instance || getInstanceForKey(issueKey);
   const response = await fetch(url, {
-    headers: { Authorization: `Basic ${auth}` },
+    headers: { Authorization: `Basic ${inst.auth}` },
   });
 
   if (!response.ok) {
@@ -195,9 +246,9 @@ function extractTextSimple(content) {
 // Cache for user lookups to avoid repeated API calls
 const userCache = new Map();
 
-async function searchUser(query) {
-  // Check cache first
-  const cacheKey = query.toLowerCase();
+async function searchUser(query, instance = defaultInstance) {
+  // Check cache first (instance-aware)
+  const cacheKey = `${instance.name}:${query.toLowerCase()}`;
   if (userCache.has(cacheKey)) {
     return userCache.get(cacheKey);
   }
@@ -206,6 +257,8 @@ async function searchUser(query) {
     // Search for users by display name
     const users = await fetchJira(
       `/user/search?query=${encodeURIComponent(query)}&maxResults=5`,
+      {},
+      instance,
     );
     if (users && users.length > 0) {
       // Find best match - prefer exact match, then starts with, then contains
@@ -232,7 +285,7 @@ async function searchUser(query) {
 
 // Parse text with @mentions and build ADF content
 // Parse inline formatting: **bold**, *italic*, @mentions
-async function parseInlineFormatting(text) {
+async function parseInlineFormatting(text, instance = defaultInstance) {
   const nodes = [];
   // Bold (**) must come before italic (*) in alternation, backticks for inline code
   const regex = /(`(.+?)`|\*\*(.+?)\*\*|\*(.+?)\*|@([A-Z][a-zA-Zà-ÿ]*(?:\s[A-Z][a-zA-Zà-ÿ]*)*))/g;
@@ -256,7 +309,7 @@ async function parseInlineFormatting(text) {
       nodes.push({ type: "text", text: match[4], marks: [{ type: "em" }] });
     } else if (match[5] !== undefined) {
       // @Mention
-      const user = await searchUser(match[5].trim());
+      const user = await searchUser(match[5].trim(), instance);
       if (user) {
         nodes.push({
           type: "mention",
@@ -278,7 +331,7 @@ async function parseInlineFormatting(text) {
 }
 
 // Parse text with markdown formatting and @mentions, build ADF content
-async function buildCommentADF(text) {
+async function buildCommentADF(text, instance = defaultInstance) {
   // Sanitize: replace em dashes and en dashes with hyphen
   text = text.replace(/[—–]/g, "-");
   // Split into blocks by double newlines (paragraphs)
@@ -297,7 +350,7 @@ async function buildCommentADF(text) {
       const listItems = [];
       for (const line of lines) {
         const itemText = line.trimStart().substring(2);
-        const inlineContent = await parseInlineFormatting(itemText);
+        const inlineContent = await parseInlineFormatting(itemText, instance);
         listItems.push({
           type: "listItem",
           content: [{ type: "paragraph", content: inlineContent }],
@@ -309,7 +362,7 @@ async function buildCommentADF(text) {
       const paragraphContent = [];
       for (let i = 0; i < lines.length; i++) {
         if (i > 0) paragraphContent.push({ type: "hardBreak" });
-        const inlineNodes = await parseInlineFormatting(lines[i]);
+        const inlineNodes = await parseInlineFormatting(lines[i], instance);
         paragraphContent.push(...inlineNodes);
       }
       content.push({ type: "paragraph", content: paragraphContent });
@@ -592,8 +645,9 @@ async function fetchFigmaDesign(url) {
 
 // ============ MAIN TICKET FUNCTION ============
 
-async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
-  const issue = await fetchJira(`/issue/${issueKey}?expand=renderedFields`);
+async function getTicket(issueKey, downloadImages = true, fetchFigma = true, instance = null) {
+  instance = instance || getInstanceForKey(issueKey);
+  const issue = await fetchJira(`/issue/${issueKey}?expand=renderedFields`, {}, instance);
   const fields = issue.fields;
   const storyPoints = fields.customfield_10016 ?? fields.story_points ?? null;
 
@@ -651,7 +705,7 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
     output += `\n## Parent Ticket: ${fields.parent.key}\n\n`;
     try {
       const parentIssue = await fetchJira(
-        `/issue/${fields.parent.key}?expand=renderedFields`,
+        `/issue/${fields.parent.key}?expand=renderedFields`, {}, instance,
       );
       const pf = parentIssue.fields;
 
@@ -716,6 +770,7 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
             att.content,
             att.filename,
             issueKey,
+            instance,
           );
           output += `  Local: ${localPath}\n`;
           downloadedImages.push(localPath);
@@ -738,7 +793,7 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
       output += `Type: ${subtask.fields?.issuetype?.name || "Subtask"}\n`;
 
       try {
-        const subtaskDetails = await fetchJira(`/issue/${subtask.key}`);
+        const subtaskDetails = await fetchJira(`/issue/${subtask.key}`, {}, instance);
         const sf = subtaskDetails.fields;
 
         if (sf.assignee) {
@@ -792,7 +847,7 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
 
       try {
         const linkedIssue = await fetchJira(
-          `/issue/${linked.key}?expand=renderedFields`,
+          `/issue/${linked.key}?expand=renderedFields`, {}, instance,
         );
         const lf = linkedIssue.fields;
 
@@ -864,7 +919,7 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
 
       try {
         const refIssue = await fetchJira(
-          `/issue/${refKey}?expand=renderedFields`,
+          `/issue/${refKey}?expand=renderedFields`, {}, instance,
         );
         const rf = refIssue.fields;
 
@@ -950,7 +1005,7 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true) {
   return { text: output, jiraImages: downloadedImages, figmaDesigns };
 }
 
-async function searchTickets(jql, maxResults = 10, fields = null) {
+async function searchTickets(jql, maxResults = 10, fields = null, instance = defaultInstance) {
   const defaultFields = [
     "summary", "status", "assignee", "reporter", "issuetype", "priority",
     "created", "resolutiondate", "updated", "statuscategorychangedate",
@@ -961,6 +1016,8 @@ async function searchTickets(jql, maxResults = 10, fields = null) {
   const requestFields = fields || defaultFields;
   const data = await fetchJira(
     `/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}&fields=${requestFields.join(",")}`,
+    {},
+    instance,
   );
 
   const issues = data.issues || [];
@@ -1122,17 +1179,20 @@ function formatChangelog(issueKey, statusHistory, created) {
   return output;
 }
 
-async function getChangelog(issueKey) {
-  const issue = await fetchJira(`/issue/${issueKey}?expand=changelog&fields=created`);
+async function getChangelog(issueKey, instance = null) {
+  instance = instance || getInstanceForKey(issueKey);
+  const issue = await fetchJira(`/issue/${issueKey}?expand=changelog&fields=created`, {}, instance);
   const statusHistory = parseStatusHistory(issue.changelog);
   const created = issue.fields?.created;
   return { statusHistory, created, formatted: formatChangelog(issueKey, statusHistory, created) };
 }
 
-async function getChangelogsBulk(jql, maxResults = 50) {
+async function getChangelogsBulk(jql, maxResults = 50, instance = defaultInstance) {
   // First get the issue keys matching the JQL
   const data = await fetchJira(
     `/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}&fields=key,created`,
+    {},
+    instance,
   );
   const issues = data.issues || [];
 
@@ -1141,7 +1201,7 @@ async function getChangelogsBulk(jql, maxResults = 50) {
   // Fetch changelog for each issue (JIRA search API doesn't support expand=changelog on /search/jql)
   for (const issue of issues) {
     try {
-      const result = await getChangelog(issue.key);
+      const result = await getChangelog(issue.key, instance);
       output += result.formatted + "\n";
     } catch (e) {
       output += `## ${issue.key}\n\n_Error fetching changelog: ${e.message}_\n\n`;
@@ -1164,10 +1224,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_get_myself",
         description:
-          "Get the current authenticated user's info including accountId. Use this to get your account ID for assigning tickets.",
+          "Get the current authenticated user's info including accountId. Use this to get your account ID for assigning tickets. When multiple Jira instances are configured, use the 'instance' parameter to specify which one.",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            instance: {
+              type: "string",
+              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+            },
+          },
           required: [],
         },
       },
@@ -1198,7 +1263,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_search",
         description:
-          "Search Jira tickets using JQL. Returns detailed fields including dates, story points, labels, components, fix versions, time tracking, and parent. Examples: 'project = MODS AND status = Open'",
+          "Search Jira tickets using JQL. Returns detailed fields including dates, story points, labels, components, fix versions, time tracking, and parent. Examples: 'project = MODS AND status = Open'. When multiple Jira instances are configured, use the 'instance' parameter to specify which one.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1212,6 +1277,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: { type: "string" },
               description:
                 "Custom list of fields to return. Default includes: summary, status, assignee, reporter, issuetype, priority, created, resolutiondate, updated, resolution, timetracking, parent, labels, components, fixVersions, customfield_10016 (story points).",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
             },
           },
           required: ["jql"],
@@ -1376,7 +1445,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_search_users",
         description:
-          "Search for Jira users by name or email. Returns account IDs and display names. Use this to find users for mentions or assignments.",
+          "Search for Jira users by name or email. Returns account IDs and display names. Use this to find users for mentions or assignments. When multiple Jira instances are configured, use the 'instance' parameter to specify which one.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1389,6 +1458,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description: "Max results (default 5)",
             },
+            instance: {
+              type: "string",
+              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+            },
           },
           required: ["query"],
         },
@@ -1396,7 +1469,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_get_changelog",
         description:
-          "Get status change history for a Jira ticket or multiple tickets via JQL. Returns all status transitions with timestamps and authors, plus computed metrics (cycle time, lead time, time in each status). Use issueKey for a single ticket, or jql for bulk retrieval.",
+          "Get status change history for a Jira ticket or multiple tickets via JQL. Returns all status transitions with timestamps and authors, plus computed metrics (cycle time, lead time, time in each status). Use issueKey for a single ticket, or jql for bulk retrieval. Instance is auto-detected from issueKey, or use the 'instance' parameter with jql.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1415,7 +1488,72 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "Max results when using jql (default 50). Each ticket requires a separate API call, so keep this reasonable.",
             },
+            instance: {
+              type: "string",
+              description: "Instance name (for multi-instance setups with jql). Auto-detected from issueKey if provided.",
+            },
           },
+          required: [],
+        },
+      },
+      {
+        name: "jira_add_instance",
+        description:
+          "Add or update a Jira instance configuration. Saves to config and makes it available immediately without restart. Use this to connect to a new Jira instance during a session.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: {
+              type: "string",
+              description: "Unique name for this instance (e.g., 'work', 'personal')",
+            },
+            email: {
+              type: "string",
+              description: "Jira account email",
+            },
+            token: {
+              type: "string",
+              description: "Jira API token (from https://id.atlassian.com/manage-profile/security/api-tokens)",
+            },
+            baseUrl: {
+              type: "string",
+              description: "Jira base URL (e.g., https://company.atlassian.net)",
+            },
+            projects: {
+              type: "array",
+              items: { type: "string" },
+              description: "Project key prefixes to auto-route to this instance (e.g., ['PROJ', 'ENG'])",
+            },
+            setDefault: {
+              type: "boolean",
+              description: "Set this instance as the default (default: false)",
+            },
+          },
+          required: ["name", "email", "token", "baseUrl"],
+        },
+      },
+      {
+        name: "jira_remove_instance",
+        description:
+          "Remove a Jira instance configuration by name. Cannot remove the last remaining instance.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: {
+              type: "string",
+              description: "Name of the instance to remove",
+            },
+          },
+          required: ["name"],
+        },
+      },
+      {
+        name: "jira_list_instances",
+        description:
+          "List all configured Jira instances with their names, URLs, project prefixes, and which is the default.",
+        inputSchema: {
+          type: "object",
+          properties: {},
           required: [],
         },
       },
@@ -1428,7 +1566,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     if (name === "jira_get_myself") {
-      const result = await fetchJira("/myself");
+      const inst = getInstanceByName(args.instance);
+      const result = await fetchJira("/myself", {}, inst);
       return {
         content: [
           {
@@ -1438,9 +1577,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_search_users") {
+      const inst = getInstanceByName(args.instance);
       const maxResults = args.maxResults || 5;
       const users = await fetchJira(
         `/user/search?query=${encodeURIComponent(args.query)}&maxResults=${maxResults}`,
+        {},
+        inst,
       );
       if (!users || users.length === 0) {
         return {
@@ -1511,11 +1653,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       return { content };
     } else if (name === "jira_search") {
-      const result = await searchTickets(args.jql, args.maxResults || 10, args.fields || null);
+      const inst = getInstanceByName(args.instance);
+      const result = await searchTickets(args.jql, args.maxResults || 10, args.fields || null, inst);
       return { content: [{ type: "text", text: result }] };
     } else if (name === "jira_add_comment") {
+      const inst = getInstanceForKey(args.issueKey);
       // Build ADF content with mention support
-      const adfContent = await buildCommentADF(args.comment);
+      const adfContent = await buildCommentADF(args.comment, inst);
       const body = {
         body: {
           version: 1,
@@ -1526,7 +1670,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const result = await fetchJira(`/issue/${args.issueKey}/comment`, {
         method: "POST",
         body,
-      });
+      }, inst);
       const author = result.author?.displayName || "Unknown";
       const created = new Date(result.created).toLocaleString();
       return {
@@ -1538,9 +1682,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_reply_comment") {
+      const inst = getInstanceForKey(args.issueKey);
       // Fetch the original comment
       const original = await fetchJira(
         `/issue/${args.issueKey}/comment/${args.commentId}`,
+        {},
+        inst,
       );
       const originalAuthor = original.author?.displayName || "Unknown";
       const originalAccountId = original.author?.accountId;
@@ -1591,7 +1738,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const result = await fetchJira(`/issue/${args.issueKey}/comment`, {
         method: "POST",
         body,
-      });
+      }, inst);
       const author = result.author?.displayName || "Unknown";
       const created = new Date(result.created).toLocaleString();
       return {
@@ -1603,8 +1750,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_edit_comment") {
+      const inst = getInstanceForKey(args.issueKey);
       // Build ADF content with mention support
-      const adfContent = await buildCommentADF(args.comment);
+      const adfContent = await buildCommentADF(args.comment, inst);
       const body = {
         body: {
           version: 1,
@@ -1615,6 +1763,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const result = await fetchJira(
         `/issue/${args.issueKey}/comment/${args.commentId}`,
         { method: "PUT", body },
+        inst,
       );
       return {
         content: [
@@ -1625,9 +1774,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_delete_comment") {
+      const inst = getInstanceForKey(args.issueKey);
       await fetchJira(`/issue/${args.issueKey}/comment/${args.commentId}`, {
         method: "DELETE",
-      });
+      }, inst);
       return {
         content: [
           {
@@ -1637,9 +1787,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_transition") {
+      const inst = getInstanceForKey(args.issueKey);
       if (!args.transitionId && !args.targetStatus) {
         // List available transitions
-        const result = await fetchJira(`/issue/${args.issueKey}/transitions`);
+        const result = await fetchJira(`/issue/${args.issueKey}/transitions`, {}, inst);
         let output = `# Available transitions for ${args.issueKey}\n\n`;
         for (const t of result.transitions || []) {
           output += `- **${t.name}** (id: ${t.id}) → status: ${t.to?.name || "Unknown"}\n`;
@@ -1657,7 +1808,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Try to reach target status, with up to 3 intermediate transitions
         for (let attempt = 0; attempt < 3; attempt++) {
-          const result = await fetchJira(`/issue/${args.issueKey}/transitions`);
+          const result = await fetchJira(`/issue/${args.issueKey}/transitions`, {}, inst);
           const available = result.transitions || [];
 
           // Check if target status is directly available
@@ -1671,7 +1822,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             await fetchJira(`/issue/${args.issueKey}/transitions`, {
               method: "POST",
               body: { transition: { id: directMatch.id } },
-            });
+            }, inst);
             transitions.push(directMatch.to?.name || directMatch.name);
             return {
               content: [
@@ -1694,7 +1845,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             await fetchJira(`/issue/${args.issueKey}/transitions`, {
               method: "POST",
               body: { transition: { id: inProgress.id } },
-            });
+            }, inst);
             transitions.push(inProgress.to?.name || "In Progress");
             continue; // Try again to find target
           }
@@ -1704,7 +1855,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         // Could not reach target status
-        const result = await fetchJira(`/issue/${args.issueKey}/transitions`);
+        const result = await fetchJira(`/issue/${args.issueKey}/transitions`, {}, inst);
         const availableNames = (result.transitions || [])
           .map((t) => t.to?.name || t.name)
           .join(", ");
@@ -1722,7 +1873,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       await fetchJira(`/issue/${args.issueKey}/transitions`, {
         method: "POST",
         body: { transition: { id: args.transitionId } },
-      });
+      }, inst);
       return {
         content: [
           {
@@ -1732,6 +1883,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_update_ticket") {
+      const inst = getInstanceForKey(args.issueKey);
       const fields = {};
       if (args.summary) {
         if (args.replaceSummary) {
@@ -1739,7 +1891,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else {
           // Append to existing title (default)
           const issue = await fetchJira(
-            `/issue/${args.issueKey}?fields=summary`,
+            `/issue/${args.issueKey}?fields=summary`, {}, inst,
           );
           const existing = issue.fields?.summary || "";
           fields.summary = existing + " " + args.summary;
@@ -1760,7 +1912,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else {
           // Append to existing (default)
           const issue = await fetchJira(
-            `/issue/${args.issueKey}?fields=description`,
+            `/issue/${args.issueKey}?fields=description`, {}, inst,
           );
           const existing = issue.fields?.description;
           if (existing && existing.content) {
@@ -1777,7 +1929,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       if (args.removeFromDescription) {
         const issue = await fetchJira(
-          `/issue/${args.issueKey}?fields=description`,
+          `/issue/${args.issueKey}?fields=description`, {}, inst,
         );
         const existing = issue.fields?.description;
         if (existing && existing.content) {
@@ -1830,7 +1982,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       await fetchJira(`/issue/${args.issueKey}`, {
         method: "PUT",
         body: { fields },
-      });
+      }, inst);
       const updated = Object.keys(fields).join(", ");
       return {
         content: [
@@ -1848,9 +2000,123 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await getChangelog(args.issueKey);
         return { content: [{ type: "text", text: result.formatted }] };
       } else {
-        const result = await getChangelogsBulk(args.jql, args.maxResults || 50);
+        const inst = getInstanceByName(args.instance);
+        const result = await getChangelogsBulk(args.jql, args.maxResults || 50, inst);
         return { content: [{ type: "text", text: result }] };
       }
+    } else if (name === "jira_add_instance") {
+      const instName = args.name.trim();
+      const projects = (args.projects || []).map((p) => p.toUpperCase());
+      const authStr = Buffer.from(`${args.email}:${args.token}`).toString("base64");
+      const newInstance = {
+        name: instName,
+        email: args.email,
+        token: args.token,
+        baseUrl: args.baseUrl.replace(/\/$/, ""),
+        projects,
+        auth: authStr,
+      };
+
+      // Update in-memory instances
+      const existingIdx = instances.findIndex((i) => i.name === instName);
+      if (existingIdx >= 0) {
+        instances[existingIdx] = newInstance;
+      } else {
+        instances.push(newInstance);
+      }
+
+      // Update default if requested or if it's the first instance
+      if (args.setDefault || instances.length === 1) {
+        // Can't reassign const, but defaultInstance is used via getInstanceByName/getInstanceForKey
+        // which search the instances array, so this is handled by rawConfig.defaultInstance below
+      }
+
+      // Persist to config file
+      const savedConfig = loadConfigFile();
+      if (!savedConfig.instances) {
+        // Migrate old format
+        if (savedConfig.email) {
+          savedConfig.instances = [{
+            name: "default",
+            email: savedConfig.email,
+            token: savedConfig.token,
+            baseUrl: savedConfig.baseUrl,
+            projects: [],
+          }];
+          savedConfig.defaultInstance = "default";
+          delete savedConfig.email;
+          delete savedConfig.token;
+          delete savedConfig.baseUrl;
+        } else {
+          savedConfig.instances = [];
+        }
+      }
+
+      // Save without the computed auth field
+      const toSave = { name: instName, email: args.email, token: args.token, baseUrl: newInstance.baseUrl, projects };
+      const savedIdx = savedConfig.instances.findIndex((i) => i.name === instName);
+      if (savedIdx >= 0) {
+        savedConfig.instances[savedIdx] = toSave;
+      } else {
+        savedConfig.instances.push(toSave);
+      }
+      if (args.setDefault || !savedConfig.defaultInstance) {
+        savedConfig.defaultInstance = instName;
+      }
+      fs.writeFileSync(jiraConfigPath, JSON.stringify(savedConfig, null, 2));
+
+      const action = existingIdx >= 0 ? "Updated" : "Added";
+      let text = `${action} instance "${instName}" (${newInstance.baseUrl}).`;
+      if (projects.length > 0) text += ` Projects: ${projects.join(", ")}.`;
+      if (args.setDefault) text += " Set as default.";
+
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "jira_remove_instance") {
+      const instName = args.name.trim();
+
+      if (instances.length <= 1) {
+        return {
+          content: [{ type: "text", text: "Cannot remove the last remaining instance." }],
+          isError: true,
+        };
+      }
+
+      const idx = instances.findIndex((i) => i.name === instName);
+      if (idx < 0) {
+        return {
+          content: [{ type: "text", text: `Instance "${instName}" not found.` }],
+          isError: true,
+        };
+      }
+
+      instances.splice(idx, 1);
+
+      // Persist to config file
+      const savedConfig = loadConfigFile();
+      if (savedConfig.instances) {
+        savedConfig.instances = savedConfig.instances.filter((i) => i.name !== instName);
+        if (savedConfig.defaultInstance === instName) {
+          savedConfig.defaultInstance = savedConfig.instances[0]?.name || null;
+        }
+        fs.writeFileSync(jiraConfigPath, JSON.stringify(savedConfig, null, 2));
+      }
+
+      return { content: [{ type: "text", text: `Removed instance "${instName}".` }] };
+
+    } else if (name === "jira_list_instances") {
+      if (instances.length === 0) {
+        return { content: [{ type: "text", text: "No instances configured." }] };
+      }
+      const currentDefault = rawConfig.defaultInstance || instances[0].name;
+      let text = `# Configured Jira Instances (${instances.length})\n\n`;
+      for (const inst of instances) {
+        const isDefault = inst.name === currentDefault ? " **(default)**" : "";
+        const projs = inst.projects?.length > 0 ? `\n  Projects: ${inst.projects.join(", ")}` : "";
+        text += `- **${inst.name}**${isDefault}: ${inst.baseUrl} (${inst.email})${projs}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
     } else {
       throw new Error(`Unknown tool: ${name}`);
     }
