@@ -1527,7 +1527,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_add_instance",
         description:
-          "Add or update a Jira instance configuration. Saves to config and makes it available immediately without restart. Use this to connect to a new Jira instance during a session.",
+          "Add or update a Jira instance configuration. Saves to config and makes it available immediately without restart. To add a new instance, provide name + email + token + baseUrl. To update an existing instance (e.g. change projects or set as default), just provide name and the fields to change.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1537,27 +1537,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             email: {
               type: "string",
-              description: "Jira account email",
+              description: "Jira account email (required for new instances)",
             },
             token: {
               type: "string",
-              description: "Jira API token (from https://id.atlassian.com/manage-profile/security/api-tokens)",
+              description: "Jira API token (required for new instances)",
             },
             baseUrl: {
               type: "string",
-              description: "Jira base URL (e.g., https://company.atlassian.net)",
+              description: "Jira base URL (required for new instances, e.g., https://company.atlassian.net)",
             },
             projects: {
               type: "array",
               items: { type: "string" },
-              description: "Project key prefixes to auto-route to this instance (e.g., ['PROJ', 'ENG'])",
+              description: "Project key prefixes to auto-route to this instance (e.g., ['PROJ', 'ENG']). Replaces existing projects.",
             },
             setDefault: {
               type: "boolean",
               description: "Set this instance as the default (default: false)",
             },
           },
-          required: ["name", "email", "token", "baseUrl"],
+          required: ["name"],
         },
       },
       {
@@ -2035,29 +2035,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     } else if (name === "jira_add_instance") {
       const instName = args.name.trim();
-      const projects = (args.projects || []).map((p) => p.toUpperCase());
-      const authStr = Buffer.from(`${args.email}:${args.token}`).toString("base64");
-      const newInstance = {
-        name: instName,
-        email: args.email,
-        token: args.token,
-        baseUrl: args.baseUrl.replace(/\/$/, ""),
-        projects,
-        auth: authStr,
-      };
+      const existingIdx = instances.findIndex((i) => i.name === instName);
+      const isUpdate = existingIdx >= 0;
+
+      // For new instances, email/token/baseUrl are required
+      if (!isUpdate && (!args.email || !args.token || !args.baseUrl)) {
+        return {
+          content: [{ type: "text", text: "New instance requires email, token, and baseUrl." }],
+          isError: true,
+        };
+      }
+
+      // Merge with existing or create new
+      const existing = isUpdate ? instances[existingIdx] : {};
+      const email = args.email || existing.email;
+      const token = args.token || existing.token;
+      const baseUrl = args.baseUrl ? args.baseUrl.replace(/\/$/, "") : existing.baseUrl;
+      const projects = args.projects ? args.projects.map((p) => p.toUpperCase()) : (existing.projects || []);
+      const authStr = Buffer.from(`${email}:${token}`).toString("base64");
+
+      const newInstance = { name: instName, email, token, baseUrl, projects, auth: authStr };
 
       // Update in-memory instances
-      const existingIdx = instances.findIndex((i) => i.name === instName);
-      if (existingIdx >= 0) {
+      if (isUpdate) {
         instances[existingIdx] = newInstance;
       } else {
         instances.push(newInstance);
-      }
-
-      // Update default if requested or if it's the first instance
-      if (args.setDefault || instances.length === 1) {
-        // Can't reassign const, but defaultInstance is used via getInstanceByName/getInstanceForKey
-        // which search the instances array, so this is handled by rawConfig.defaultInstance below
       }
 
       // Persist to config file
@@ -2082,7 +2085,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       // Save without the computed auth field
-      const toSave = { name: instName, email: args.email, token: args.token, baseUrl: newInstance.baseUrl, projects };
+      const toSave = { name: instName, email, token, baseUrl, projects };
       const savedIdx = savedConfig.instances.findIndex((i) => i.name === instName);
       if (savedIdx >= 0) {
         savedConfig.instances[savedIdx] = toSave;
@@ -2094,8 +2097,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       fs.writeFileSync(jiraConfigPath, JSON.stringify(savedConfig, null, 2));
 
-      const action = existingIdx >= 0 ? "Updated" : "Added";
-      let text = `${action} instance "${instName}" (${newInstance.baseUrl}).`;
+      const action = isUpdate ? "Updated" : "Added";
+      let text = `${action} instance "${instName}" (${baseUrl}).`;
       if (projects.length > 0) text += ` Projects: ${projects.join(", ")}.`;
       if (args.setDefault) text += " Set as default.";
 
