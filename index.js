@@ -1256,6 +1256,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "Fetch linked Figma designs and export images (default: true)",
             },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
           },
           required: ["issueKey"],
         },
@@ -1298,6 +1302,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "The Jira issue key (e.g., MODS-123)",
             },
             comment: { type: "string", description: "The comment text to add" },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
           },
           required: ["issueKey", "comment"],
         },
@@ -1319,6 +1327,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 "The ID of the comment to reply to. Use jira_get_ticket to see comments and their IDs.",
             },
             reply: { type: "string", description: "The reply text" },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
           },
           required: ["issueKey", "commentId", "reply"],
         },
@@ -1340,6 +1352,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 "The ID of the comment to edit. Use jira_get_ticket to see comments and their IDs.",
             },
             comment: { type: "string", description: "The new comment text" },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
           },
           required: ["issueKey", "commentId", "comment"],
         },
@@ -1359,6 +1375,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description:
                 "The ID of the comment to delete. Use jira_get_ticket to see comments and their IDs.",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
             },
           },
           required: ["issueKey", "commentId"],
@@ -1384,6 +1404,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description:
                 "Target status name (e.g., 'Review', 'Done'). Will auto-transition through intermediate states if needed.",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
             },
           },
           required: ["issueKey"],
@@ -1437,6 +1461,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "array",
               items: { type: "string" },
               description: "Labels to set on the ticket",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
             },
           },
           required: ["issueKey"],
@@ -1609,7 +1637,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } else if (name === "jira_get_ticket") {
       const downloadImages = args.downloadImages !== false;
       const fetchFigma = args.fetchFigma !== false;
-      const result = await getTicket(args.issueKey, downloadImages, fetchFigma);
+      const inst = args.instance ? getInstanceByName(args.instance) : null;
+      const result = await getTicket(args.issueKey, downloadImages, fetchFigma, inst);
 
       const content = [{ type: "text", text: result.text }];
 
@@ -1657,7 +1686,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const result = await searchTickets(args.jql, args.maxResults || 10, args.fields || null, inst);
       return { content: [{ type: "text", text: result }] };
     } else if (name === "jira_add_comment") {
-      const inst = getInstanceForKey(args.issueKey);
+      const inst = args.instance ? getInstanceByName(args.instance) : getInstanceForKey(args.issueKey);
       // Build ADF content with mention support
       const adfContent = await buildCommentADF(args.comment, inst);
       const body = {
@@ -1682,7 +1711,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_reply_comment") {
-      const inst = getInstanceForKey(args.issueKey);
+      const inst = args.instance ? getInstanceByName(args.instance) : getInstanceForKey(args.issueKey);
       // Fetch the original comment
       const original = await fetchJira(
         `/issue/${args.issueKey}/comment/${args.commentId}`,
@@ -1750,7 +1779,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_edit_comment") {
-      const inst = getInstanceForKey(args.issueKey);
+      const inst = args.instance ? getInstanceByName(args.instance) : getInstanceForKey(args.issueKey);
       // Build ADF content with mention support
       const adfContent = await buildCommentADF(args.comment, inst);
       const body = {
@@ -1774,7 +1803,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_delete_comment") {
-      const inst = getInstanceForKey(args.issueKey);
+      const inst = args.instance ? getInstanceByName(args.instance) : getInstanceForKey(args.issueKey);
       await fetchJira(`/issue/${args.issueKey}/comment/${args.commentId}`, {
         method: "DELETE",
       }, inst);
@@ -1787,7 +1816,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_transition") {
-      const inst = getInstanceForKey(args.issueKey);
+      const inst = args.instance ? getInstanceByName(args.instance) : getInstanceForKey(args.issueKey);
       if (!args.transitionId && !args.targetStatus) {
         // List available transitions
         const result = await fetchJira(`/issue/${args.issueKey}/transitions`, {}, inst);
@@ -1883,7 +1912,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_update_ticket") {
-      const inst = getInstanceForKey(args.issueKey);
+      const inst = args.instance ? getInstanceByName(args.instance) : getInstanceForKey(args.issueKey);
       const fields = {};
       if (args.summary) {
         if (args.replaceSummary) {
