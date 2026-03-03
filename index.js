@@ -1635,6 +1635,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_get_ticket") {
+      if (!args.issueKey) {
+        return { content: [{ type: "text", text: "Error: Missing required parameter 'issueKey'. You passed 'ticketId' which is not a valid parameter. Use 'issueKey' instead (e.g. issueKey: \"MODS-12115\")." }] };
+      }
       const downloadImages = args.downloadImages !== false;
       const fetchFigma = args.fetchFigma !== false;
       const inst = args.instance ? getInstanceByName(args.instance) : null;
