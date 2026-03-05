@@ -195,14 +195,22 @@ function extractText(content, urls = []) {
   if (content.content) {
     for (const node of content.content) {
       if (node.type === "text") {
-        text += node.text || "";
+        const nodeText = node.text || "";
         // Check for link marks
-        if (node.marks) {
-          for (const mark of node.marks) {
-            if (mark.type === "link" && mark.attrs?.href) {
-              urls.push(mark.attrs.href);
-            }
+        const linkMark = node.marks?.find(
+          (m) => m.type === "link" && m.attrs?.href,
+        );
+        if (linkMark) {
+          const href = linkMark.attrs.href;
+          urls.push(href);
+          // Render as markdown link if the display text differs from the URL
+          if (nodeText && nodeText !== href) {
+            text += `[${nodeText}](${href})`;
+          } else {
+            text += href;
           }
+        } else {
+          text += nodeText;
         }
       } else if (node.type === "paragraph") {
         const result = extractText(node, urls);
