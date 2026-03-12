@@ -316,13 +316,25 @@ async function parseInlineFormatting(text, instance = defaultInstance) {
       // *italic*
       nodes.push({ type: "text", text: match[4], marks: [{ type: "em" }] });
     } else if (match[5] !== undefined) {
-      // @Mention
-      const user = await searchUser(match[5].trim(), instance);
+      // @Mention — regex may greedily capture extra capitalized words beyond the actual name.
+      // After resolving, only consume the portion matching the display name.
+      const captured = match[5].trim();
+      const user = await searchUser(captured, instance);
       if (user) {
         nodes.push({
           type: "mention",
           attrs: { id: user.accountId, text: `@${user.displayName}` },
         });
+        // Only consume "@" + display name length from the captured text.
+        // If the captured text starts with the display name (case-insensitive),
+        // use the display name length; otherwise fall back to full match.
+        const dn = user.displayName;
+        const consumeLen = captured.toLowerCase().startsWith(dn.toLowerCase())
+          ? dn.length
+          : captured.length;
+        lastIndex = match.index + 1 + consumeLen;
+        regex.lastIndex = lastIndex;
+        continue;
       } else {
         nodes.push({ type: "text", text: match[0] });
       }
