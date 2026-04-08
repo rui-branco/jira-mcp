@@ -2662,16 +2662,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
       if (args.description) {
-        const newParagraph = {
-          type: "paragraph",
-          content: [{ type: "text", text: args.description }],
-        };
+        const adfContent = await buildCommentADF(args.description, inst);
         if (args.replaceDescription) {
           // Full replace
           fields.description = {
             version: 1,
             type: "doc",
-            content: [newParagraph],
+            content: adfContent,
           };
         } else {
           // Append to existing (default)
@@ -2680,13 +2677,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           );
           const existing = issue.fields?.description;
           if (existing && existing.content) {
-            existing.content.push(newParagraph);
+            existing.content.push(...adfContent);
             fields.description = existing;
           } else {
             fields.description = {
               version: 1,
               type: "doc",
-              content: [newParagraph],
+              content: adfContent,
             };
           }
         }
