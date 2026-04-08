@@ -160,6 +160,30 @@ async function fetchJira(endpoint, options = {}, instance = defaultInstance) {
   return text ? JSON.parse(text) : {};
 }
 
+async function fetchJiraAgile(endpoint, options = {}, instance = defaultInstance) {
+  const { method = "GET", body } = options;
+  const headers = {
+    Authorization: `Basic ${instance.auth}`,
+    Accept: "application/json",
+  };
+  if (body) {
+    headers["Content-Type"] = "application/json";
+  }
+  const response = await fetch(`${instance.baseUrl}/rest/agile/1.0${endpoint}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => "");
+    throw new Error(
+      `Jira Agile API error: ${response.status} ${response.statusText}${errorBody ? ` - ${errorBody}` : ""}`,
+    );
+  }
+  const text = await response.text();
+  return text ? JSON.parse(text) : {};
+}
+
 async function downloadAttachment(url, filename, issueKey, instance) {
   const issueDir = path.join(attachmentDir, issueKey);
   if (!fs.existsSync(issueDir)) {
@@ -292,11 +316,11 @@ async function searchUser(query, instance = defaultInstance) {
 }
 
 // Parse text with @mentions and build ADF content
-// Parse inline formatting: **bold**, *italic*, @mentions
+// Parse inline formatting: **bold**, *italic*, `code`, [links](url), @mentions
 async function parseInlineFormatting(text, instance = defaultInstance) {
   const nodes = [];
-  // Bold (**) must come before italic (*) in alternation, backticks for inline code
-  const regex = /(`(.+?)`|\*\*(.+?)\*\*|\*(.+?)\*|@([A-Z][a-zA-Zà-ÿ]*(?:\s[A-Z][a-zA-Zà-ÿ]*)*))/g;
+  // Links, bold, italic, inline code, mentions — links must come first to avoid ** inside link text being parsed as bold
+  const regex = /(\[([^\]]+)\]\(([^)]+)\)|`(.+?)`|\*\*(.+?)\*\*|\*(.+?)\*|~~(.+?)~~|@([A-Z][a-zA-Zà-ÿ]*(?:\s[A-Z][a-zA-Zà-ÿ]*)*))/g;
 
   let lastIndex = 0;
   let match;
@@ -306,19 +330,29 @@ async function parseInlineFormatting(text, instance = defaultInstance) {
       nodes.push({ type: "text", text: text.substring(lastIndex, match.index) });
     }
 
-    if (match[2] !== undefined) {
-      // `inline code`
-      nodes.push({ type: "text", text: match[2], marks: [{ type: "code" }] });
-    } else if (match[3] !== undefined) {
-      // **bold**
-      nodes.push({ type: "text", text: match[3], marks: [{ type: "strong" }] });
+    if (match[2] !== undefined && match[3] !== undefined) {
+      // [link text](url)
+      nodes.push({
+        type: "text",
+        text: match[2],
+        marks: [{ type: "link", attrs: { href: match[3] } }],
+      });
     } else if (match[4] !== undefined) {
-      // *italic*
-      nodes.push({ type: "text", text: match[4], marks: [{ type: "em" }] });
+      // `inline code`
+      nodes.push({ type: "text", text: match[4], marks: [{ type: "code" }] });
     } else if (match[5] !== undefined) {
+      // **bold**
+      nodes.push({ type: "text", text: match[5], marks: [{ type: "strong" }] });
+    } else if (match[6] !== undefined) {
+      // *italic*
+      nodes.push({ type: "text", text: match[6], marks: [{ type: "em" }] });
+    } else if (match[7] !== undefined) {
+      // ~~strikethrough~~
+      nodes.push({ type: "text", text: match[7], marks: [{ type: "strike" }] });
+    } else if (match[8] !== undefined) {
       // @Mention — regex may greedily capture extra capitalized words beyond the actual name.
       // After resolving, only consume the portion matching the display name.
-      const captured = match[5].trim();
+      const captured = match[8].trim();
       const user = await searchUser(captured, instance);
       if (user) {
         nodes.push({
@@ -354,37 +388,167 @@ async function parseInlineFormatting(text, instance = defaultInstance) {
 async function buildCommentADF(text, instance = defaultInstance) {
   // Sanitize: replace em dashes and en dashes with hyphen
   text = text.replace(/[—–]/g, "-");
-  // Split into blocks by double newlines (paragraphs)
-  const blocks = text.split(/\n\n+/);
+
   const content = [];
+  const lines = text.split("\n");
+  let i = 0;
 
-  for (const block of blocks) {
-    const trimmed = block.trim();
-    if (!trimmed) continue;
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
 
-    const lines = trimmed.split("\n");
-    const isBulletList = lines.every((l) => l.trimStart().startsWith("- "));
+    // Skip empty lines
+    if (!trimmed) {
+      i++;
+      continue;
+    }
 
-    if (isBulletList) {
-      // Bullet list block
+    // --- Code block (triple backticks) ---
+    if (trimmed.startsWith("```")) {
+      const lang = trimmed.substring(3).trim() || null;
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !lines[i].trim().startsWith("```")) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) i++; // skip closing ```
+      const codeBlock = {
+        type: "codeBlock",
+        content: [{ type: "text", text: codeLines.join("\n") }],
+      };
+      if (lang) codeBlock.attrs = { language: lang };
+      content.push(codeBlock);
+      continue;
+    }
+
+    // --- Horizontal rule ---
+    if (/^-{3,}$/.test(trimmed) || /^\*{3,}$/.test(trimmed) || /^_{3,}$/.test(trimmed)) {
+      content.push({ type: "rule" });
+      i++;
+      continue;
+    }
+
+    // --- Headings (# to ######) ---
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const headingText = headingMatch[2];
+      const inlineContent = await parseInlineFormatting(headingText, instance);
+      content.push({
+        type: "heading",
+        attrs: { level },
+        content: inlineContent,
+      });
+      i++;
+      continue;
+    }
+
+    // --- Blockquote (> lines) ---
+    if (trimmed.startsWith("> ")) {
+      const quoteLines = [];
+      while (i < lines.length && lines[i].trim().startsWith("> ")) {
+        quoteLines.push(lines[i].trim().substring(2));
+        i++;
+      }
+      const quoteContent = await parseInlineFormatting(quoteLines.join("\n"), instance);
+      content.push({
+        type: "blockquote",
+        content: [{ type: "paragraph", content: quoteContent }],
+      });
+      continue;
+    }
+
+    // --- Table (pipe-separated) ---
+    if (trimmed.startsWith("|") && trimmed.endsWith("|")) {
+      const tableRows = [];
+      while (i < lines.length && lines[i].trim().startsWith("|") && lines[i].trim().endsWith("|")) {
+        const row = lines[i].trim();
+        // Skip separator rows (|---|---|)
+        if (/^\|[\s\-:|]+\|$/.test(row)) {
+          i++;
+          continue;
+        }
+        const cells = row
+          .substring(1, row.length - 1)
+          .split("|")
+          .map((c) => c.trim());
+        tableRows.push(cells);
+        i++;
+      }
+      if (tableRows.length > 0) {
+        const isHeader = tableRows.length > 1;
+        const adfRows = [];
+        for (let r = 0; r < tableRows.length; r++) {
+          const cellType = r === 0 && isHeader ? "tableHeader" : "tableCell";
+          const adfCells = [];
+          for (const cellText of tableRows[r]) {
+            const inlineContent = await parseInlineFormatting(cellText, instance);
+            adfCells.push({
+              type: cellType,
+              content: [{ type: "paragraph", content: inlineContent }],
+            });
+          }
+          adfRows.push({ type: "tableRow", content: adfCells });
+        }
+        content.push({ type: "table", content: adfRows });
+      }
+      continue;
+    }
+
+    // --- Bullet list (- items) ---
+    if (trimmed.startsWith("- ")) {
       const listItems = [];
-      for (const line of lines) {
-        const itemText = line.trimStart().substring(2);
+      while (i < lines.length && lines[i].trim().startsWith("- ")) {
+        const itemText = lines[i].trim().substring(2);
         const inlineContent = await parseInlineFormatting(itemText, instance);
         listItems.push({
           type: "listItem",
           content: [{ type: "paragraph", content: inlineContent }],
         });
+        i++;
       }
       content.push({ type: "bulletList", content: listItems });
-    } else {
-      // Regular paragraph — single newlines become hardBreaks
-      const paragraphContent = [];
-      for (let i = 0; i < lines.length; i++) {
-        if (i > 0) paragraphContent.push({ type: "hardBreak" });
-        const inlineNodes = await parseInlineFormatting(lines[i], instance);
-        paragraphContent.push(...inlineNodes);
+      continue;
+    }
+
+    // --- Ordered list (1. items) ---
+    if (/^\d+\.\s/.test(trimmed)) {
+      const listItems = [];
+      while (i < lines.length && /^\d+\.\s/.test(lines[i].trim())) {
+        const itemText = lines[i].trim().replace(/^\d+\.\s/, "");
+        const inlineContent = await parseInlineFormatting(itemText, instance);
+        listItems.push({
+          type: "listItem",
+          content: [{ type: "paragraph", content: inlineContent }],
+        });
+        i++;
       }
+      content.push({ type: "orderedList", content: listItems });
+      continue;
+    }
+
+    // --- Regular paragraph (collect consecutive non-special lines) ---
+    const paragraphContent = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !lines[i].trim().startsWith("```") &&
+      !lines[i].trim().startsWith("# ") &&
+      !lines[i].trim().startsWith("## ") &&
+      !lines[i].trim().startsWith("### ") &&
+      !lines[i].trim().startsWith("> ") &&
+      !lines[i].trim().startsWith("- ") &&
+      !/^\d+\.\s/.test(lines[i].trim()) &&
+      !/^-{3,}$/.test(lines[i].trim()) &&
+      !(lines[i].trim().startsWith("|") && lines[i].trim().endsWith("|"))
+    ) {
+      if (paragraphContent.length > 0) paragraphContent.push({ type: "hardBreak" });
+      const inlineNodes = await parseInlineFormatting(lines[i].trim(), instance);
+      paragraphContent.push(...inlineNodes);
+      i++;
+    }
+    if (paragraphContent.length > 0) {
       content.push({ type: "paragraph", content: paragraphContent });
     }
   }
@@ -1605,6 +1769,554 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: [],
         },
       },
+      {
+        name: "jira_create_ticket",
+        description:
+          "Create a new Jira issue (story, task, bug, epic, etc.). Returns the new issue key and URL. Use jira_search_users to get account IDs for assignee. NEVER use em dashes or en dashes in text fields.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            projectKey: {
+              type: "string",
+              description: "The project key (e.g., MODS, ENG)",
+            },
+            issueType: {
+              type: "string",
+              description: "Issue type name (e.g., Story, Task, Bug, Epic, Sub-task)",
+            },
+            summary: {
+              type: "string",
+              description: "The issue title/summary",
+            },
+            description: {
+              type: "string",
+              description: "The issue description text. Supports @mentions via @DisplayName.",
+            },
+            assignee: {
+              type: "string",
+              description: "Assignee account ID. Use jira_search_users or jira_get_myself to get this.",
+            },
+            priority: {
+              type: "string",
+              description: "Priority name (e.g., Highest, High, Medium, Low, Lowest)",
+            },
+            labels: {
+              type: "array",
+              items: { type: "string" },
+              description: "Labels to set on the ticket",
+            },
+            components: {
+              type: "array",
+              items: { type: "string" },
+              description: "Component names to set on the ticket",
+            },
+            fixVersions: {
+              type: "array",
+              items: { type: "string" },
+              description: "Fix version names to set on the ticket",
+            },
+            storyPoints: {
+              type: "number",
+              description: "Story points value",
+            },
+            parentKey: {
+              type: "string",
+              description: "Parent issue key for creating issues within an epic (e.g., MODS-100). For subtasks, use jira_create_subtask instead.",
+            },
+            sprintId: {
+              type: "number",
+              description: "Sprint ID to add the ticket to. Use jira_get_sprints to find sprint IDs.",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from project key if omitted.",
+            },
+          },
+          required: ["projectKey", "issueType", "summary"],
+        },
+      },
+      {
+        name: "jira_create_subtask",
+        description:
+          "Create a subtask under a parent Jira ticket. The subtask is created in the same project as the parent. NEVER use em dashes or en dashes in text fields.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            parentKey: {
+              type: "string",
+              description: "The parent issue key (e.g., MODS-123)",
+            },
+            summary: {
+              type: "string",
+              description: "The subtask title/summary",
+            },
+            description: {
+              type: "string",
+              description: "The subtask description text. Supports @mentions via @DisplayName.",
+            },
+            assignee: {
+              type: "string",
+              description: "Assignee account ID. Use jira_search_users or jira_get_myself to get this.",
+            },
+            priority: {
+              type: "string",
+              description: "Priority name (e.g., Highest, High, Medium, Low, Lowest)",
+            },
+            labels: {
+              type: "array",
+              items: { type: "string" },
+              description: "Labels to set on the subtask",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from parent issue key prefix if omitted.",
+            },
+          },
+          required: ["parentKey", "summary"],
+        },
+      },
+      {
+        name: "jira_link_tickets",
+        description:
+          "Link two Jira tickets together with a relationship type. Use jira_get_link_types to discover available link type names. Common types: 'Blocks' (blocks/is blocked by), 'Relates' (relates to), 'Duplicate' (duplicates/is duplicated by), 'Cloners' (clones/is cloned by).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            inwardIssueKey: {
+              type: "string",
+              description: "The inward issue key (e.g., MODS-123). Receives the inward description (e.g., 'is blocked by').",
+            },
+            outwardIssueKey: {
+              type: "string",
+              description: "The outward issue key (e.g., MODS-456). Receives the outward description (e.g., 'blocks').",
+            },
+            linkType: {
+              type: "string",
+              description: "The link type name (e.g., 'Blocks', 'Relates', 'Duplicate'). Use jira_get_link_types to see available types.",
+            },
+            comment: {
+              type: "string",
+              description: "Optional comment to add when creating the link.",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from inward issue key prefix if omitted.",
+            },
+          },
+          required: ["inwardIssueKey", "outwardIssueKey", "linkType"],
+        },
+      },
+      {
+        name: "jira_delete_ticket",
+        description:
+          "Delete a Jira ticket. This action is IRREVERSIBLE. If the ticket has subtasks, set deleteSubtasks to true or the deletion will fail.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key to delete (e.g., MODS-123)",
+            },
+            deleteSubtasks: {
+              type: "boolean",
+              description: "If true, also deletes all subtasks. If false (default), deletion fails when subtasks exist.",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
+          },
+          required: ["issueKey"],
+        },
+      },
+      {
+        name: "jira_add_attachment",
+        description:
+          "Upload a file attachment to a Jira ticket. Provide either a local file path or base64-encoded file content.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123)",
+            },
+            filePath: {
+              type: "string",
+              description: "Absolute path to the local file to upload. Use this OR fileContent, not both.",
+            },
+            fileContent: {
+              type: "string",
+              description: "Base64-encoded file content. Must also provide fileName when using this.",
+            },
+            fileName: {
+              type: "string",
+              description: "File name (required when using fileContent, optional with filePath to override the original name).",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
+          },
+          required: ["issueKey"],
+        },
+      },
+      {
+        name: "jira_get_link_types",
+        description:
+          "List all available issue link types in the Jira instance. Use this to discover valid link type names before using jira_link_tickets.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            instance: {
+              type: "string",
+              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "jira_get_transitions",
+        description:
+          "List available status transitions for a Jira ticket. Use this to discover valid transition names/IDs before using jira_transition.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123)",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
+          },
+          required: ["issueKey"],
+        },
+      },
+      {
+        name: "jira_unlink_tickets",
+        description:
+          "Remove a link between two Jira tickets. Fetches the issue to find the link ID automatically.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: {
+              type: "string",
+              description: "One of the linked issue keys (e.g., MODS-123). The link will be found from this issue.",
+            },
+            linkedIssueKey: {
+              type: "string",
+              description: "The other linked issue key (e.g., MODS-456).",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
+          },
+          required: ["issueKey", "linkedIssueKey"],
+        },
+      },
+      {
+        name: "jira_remove_attachment",
+        description:
+          "Remove an attachment from a Jira ticket by attachment ID or filename. If using filename, fetches the ticket to find the attachment ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123). Required when using fileName.",
+            },
+            attachmentId: {
+              type: "string",
+              description: "The attachment ID to delete. Use this OR fileName.",
+            },
+            fileName: {
+              type: "string",
+              description: "The attachment filename to delete. Use this OR attachmentId.",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "jira_add_watcher",
+        description:
+          "Add a watcher to a Jira ticket. The watcher will receive notifications for changes on the ticket.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123)",
+            },
+            accountId: {
+              type: "string",
+              description: "The account ID of the user to add as watcher. Use jira_search_users to find this.",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
+          },
+          required: ["issueKey", "accountId"],
+        },
+      },
+      {
+        name: "jira_remove_watcher",
+        description:
+          "Remove a watcher from a Jira ticket.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123)",
+            },
+            accountId: {
+              type: "string",
+              description: "The account ID of the user to remove as watcher.",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
+          },
+          required: ["issueKey", "accountId"],
+        },
+      },
+      {
+        name: "jira_add_worklog",
+        description:
+          "Log time/work on a Jira ticket. Use Jira time format for timeSpent (e.g., '2h 30m', '1d', '30m').",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123)",
+            },
+            timeSpent: {
+              type: "string",
+              description: "Time spent in Jira format (e.g., '2h 30m', '1d', '4h')",
+            },
+            comment: {
+              type: "string",
+              description: "Optional work description/comment",
+            },
+            started: {
+              type: "string",
+              description: "When the work started in ISO 8601 format (e.g., '2026-04-08T09:00:00.000+0000'). Defaults to now.",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
+          },
+          required: ["issueKey", "timeSpent"],
+        },
+      },
+      {
+        name: "jira_get_worklogs",
+        description:
+          "Get work logs (time tracking entries) for a Jira ticket.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: {
+              type: "string",
+              description: "The Jira issue key (e.g., MODS-123)",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
+          },
+          required: ["issueKey"],
+        },
+      },
+      {
+        name: "jira_clone_ticket",
+        description:
+          "Clone/duplicate a Jira ticket. Creates a new ticket with the same summary, description, priority, labels, and components. Optionally links the clone to the original.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: {
+              type: "string",
+              description: "The issue key to clone (e.g., MODS-123)",
+            },
+            summaryPrefix: {
+              type: "string",
+              description: "Prefix to add to the cloned ticket summary (default: 'CLONE - ')",
+            },
+            linkToOriginal: {
+              type: "boolean",
+              description: "If true (default), creates a 'Cloners' link between the clone and original.",
+            },
+            targetProjectKey: {
+              type: "string",
+              description: "Project key for the clone. Defaults to the same project as the original.",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+            },
+          },
+          required: ["issueKey"],
+        },
+      },
+      {
+        name: "jira_move_to_sprint",
+        description:
+          "Move one or more tickets into a sprint. Use jira_get_sprints to find sprint IDs.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            sprintId: {
+              type: "number",
+              description: "The sprint ID to move tickets into. Use jira_get_sprints to find this.",
+            },
+            issueKeys: {
+              type: "array",
+              items: { type: "string" },
+              description: "Array of issue keys to move (e.g., ['MODS-123', 'MODS-456'])",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+            },
+          },
+          required: ["sprintId", "issueKeys"],
+        },
+      },
+      {
+        name: "jira_get_sprints",
+        description:
+          "List sprints for an agile board. Returns sprint IDs, names, states, and dates.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            boardId: {
+              type: "number",
+              description: "The board ID. Use jira_get_boards to find this.",
+            },
+            state: {
+              type: "string",
+              description: "Filter by sprint state: 'active', 'future', 'closed', or comma-separated (e.g., 'active,future'). Defaults to all.",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+            },
+          },
+          required: ["boardId"],
+        },
+      },
+      {
+        name: "jira_get_boards",
+        description:
+          "List agile boards (Scrum or Kanban). Optionally filter by project key or board name.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            projectKeyOrId: {
+              type: "string",
+              description: "Filter boards by project key or ID (e.g., MODS)",
+            },
+            name: {
+              type: "string",
+              description: "Filter boards by name (partial match)",
+            },
+            type: {
+              type: "string",
+              description: "Filter by board type: 'scrum', 'kanban', or 'simple'",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "jira_get_issue_types",
+        description:
+          "List available issue types for a project. Useful before creating tickets to know valid issue type names.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            projectKey: {
+              type: "string",
+              description: "The project key (e.g., MODS)",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from project key if omitted.",
+            },
+          },
+          required: ["projectKey"],
+        },
+      },
+      {
+        name: "jira_get_priorities",
+        description:
+          "List all available priority levels in the Jira instance.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            instance: {
+              type: "string",
+              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "jira_get_components",
+        description:
+          "List all components for a project. Useful before creating tickets to know valid component names.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            projectKey: {
+              type: "string",
+              description: "The project key (e.g., MODS)",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from project key if omitted.",
+            },
+          },
+          required: ["projectKey"],
+        },
+      },
+      {
+        name: "jira_get_versions",
+        description:
+          "List all versions/releases for a project. Useful for setting fixVersions on tickets.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            projectKey: {
+              type: "string",
+              description: "The project key (e.g., MODS)",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name override. Auto-detected from project key if omitted.",
+            },
+          },
+          required: ["projectKey"],
+        },
+      },
     ],
   };
 });
@@ -2172,6 +2884,624 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       return { content: [{ type: "text", text }] };
 
+    } else if (name === "jira_create_ticket") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForProject(args.projectKey);
+
+      const fields = {
+        project: { key: args.projectKey.toUpperCase() },
+        issuetype: { name: args.issueType },
+        summary: args.summary,
+      };
+
+      if (args.description) {
+        const adfContent = await buildCommentADF(args.description, inst);
+        fields.description = {
+          version: 1,
+          type: "doc",
+          content: adfContent,
+        };
+      }
+      if (args.assignee) {
+        fields.assignee = { accountId: args.assignee };
+      }
+      if (args.priority) {
+        fields.priority = { name: args.priority };
+      }
+      if (args.labels) {
+        fields.labels = args.labels;
+      }
+      if (args.components) {
+        fields.components = args.components.map((c) => ({ name: c }));
+      }
+      if (args.fixVersions) {
+        fields.fixVersions = args.fixVersions.map((v) => ({ name: v }));
+      }
+      if (args.storyPoints != null) {
+        fields.customfield_10016 = args.storyPoints;
+      }
+      if (args.parentKey) {
+        fields.parent = { key: args.parentKey };
+      }
+
+      const result = await fetchJira("/issue", { method: "POST", body: { fields } }, inst);
+      const newKey = result.key;
+
+      if (args.sprintId) {
+        await fetchJiraAgile(
+          `/sprint/${args.sprintId}/issue`,
+          { method: "POST", body: { issues: [newKey] } },
+          inst,
+        );
+      }
+
+      let text = `Created ${newKey}: ${args.summary}\nURL: ${inst.baseUrl}/browse/${newKey}`;
+      if (args.sprintId) text += `\nAdded to sprint ${args.sprintId}.`;
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "jira_create_subtask") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForKey(args.parentKey);
+      const projectKey = args.parentKey.split("-")[0];
+
+      const fields = {
+        project: { key: projectKey },
+        parent: { key: args.parentKey },
+        issuetype: { name: "Sub-task" },
+        summary: args.summary,
+      };
+
+      if (args.description) {
+        const adfContent = await buildCommentADF(args.description, inst);
+        fields.description = {
+          version: 1,
+          type: "doc",
+          content: adfContent,
+        };
+      }
+      if (args.assignee) {
+        fields.assignee = { accountId: args.assignee };
+      }
+      if (args.priority) {
+        fields.priority = { name: args.priority };
+      }
+      if (args.labels) {
+        fields.labels = args.labels;
+      }
+
+      const result = await fetchJira("/issue", { method: "POST", body: { fields } }, inst);
+      const newKey = result.key;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Created subtask ${newKey} under ${args.parentKey}: ${args.summary}\nURL: ${inst.baseUrl}/browse/${newKey}`,
+          },
+        ],
+      };
+
+    } else if (name === "jira_link_tickets") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForKey(args.inwardIssueKey);
+
+      const body = {
+        type: { name: args.linkType },
+        inwardIssue: { key: args.inwardIssueKey },
+        outwardIssue: { key: args.outwardIssueKey },
+      };
+
+      if (args.comment) {
+        const adfContent = await buildCommentADF(args.comment, inst);
+        body.comment = {
+          body: {
+            version: 1,
+            type: "doc",
+            content: adfContent,
+          },
+        };
+      }
+
+      await fetchJira("/issueLink", { method: "POST", body }, inst);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Linked ${args.inwardIssueKey} and ${args.outwardIssueKey} with "${args.linkType}".`,
+          },
+        ],
+      };
+
+    } else if (name === "jira_delete_ticket") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForKey(args.issueKey);
+      const deleteSubtasks = args.deleteSubtasks ? "true" : "false";
+      await fetchJira(
+        `/issue/${args.issueKey}?deleteSubtasks=${deleteSubtasks}`,
+        { method: "DELETE" },
+        inst,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Deleted ${args.issueKey}${args.deleteSubtasks ? " (including subtasks)" : ""}.`,
+          },
+        ],
+      };
+
+    } else if (name === "jira_add_attachment") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForKey(args.issueKey);
+
+      let fileBuffer;
+      let fileName;
+
+      if (args.filePath) {
+        if (!fs.existsSync(args.filePath)) {
+          return {
+            content: [{ type: "text", text: `Error: File not found: ${args.filePath}` }],
+            isError: true,
+          };
+        }
+        fileBuffer = fs.readFileSync(args.filePath);
+        fileName = args.fileName || path.basename(args.filePath);
+      } else if (args.fileContent) {
+        if (!args.fileName) {
+          return {
+            content: [{ type: "text", text: "Error: fileName is required when using fileContent." }],
+            isError: true,
+          };
+        }
+        fileBuffer = Buffer.from(args.fileContent, "base64");
+        fileName = args.fileName;
+      } else {
+        return {
+          content: [{ type: "text", text: "Error: Provide either filePath or fileContent." }],
+          isError: true,
+        };
+      }
+
+      const boundary = "----JiraMCPBoundary" + Date.now();
+      const header = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`;
+      const footer = `\r\n--${boundary}--\r\n`;
+
+      const bodyBuffer = Buffer.concat([
+        Buffer.from(header),
+        fileBuffer,
+        Buffer.from(footer),
+      ]);
+
+      const response = await fetch(
+        `${inst.baseUrl}/rest/api/3/issue/${args.issueKey}/attachments`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Basic ${inst.auth}`,
+            "X-Atlassian-Token": "no-check",
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+          },
+          body: bodyBuffer,
+        },
+      );
+
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => "");
+        throw new Error(
+          `Jira API error: ${response.status} ${response.statusText}${errorBody ? ` - ${errorBody}` : ""}`,
+        );
+      }
+
+      const result = await response.json();
+      const attachments = Array.isArray(result) ? result : [result];
+      const names = attachments.map((a) => a.filename).join(", ");
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Uploaded ${names} to ${args.issueKey}.`,
+          },
+        ],
+      };
+
+    } else if (name === "jira_get_link_types") {
+      const inst = getInstanceByName(args.instance);
+      const result = await fetchJira("/issueLinkType", {}, inst);
+      const linkTypes = result.issueLinkTypes || [];
+      if (linkTypes.length === 0) {
+        return { content: [{ type: "text", text: "No link types found." }] };
+      }
+      let text = `# Available Link Types (${linkTypes.length})\n\n`;
+      for (const lt of linkTypes) {
+        text += `- **${lt.name}** (id: ${lt.id})\n`;
+        text += `  Inward: "${lt.inward}" | Outward: "${lt.outward}"\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "jira_get_transitions") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForKey(args.issueKey);
+      const result = await fetchJira(`/issue/${args.issueKey}/transitions`, {}, inst);
+      const transitions = result.transitions || [];
+      if (transitions.length === 0) {
+        return { content: [{ type: "text", text: `No transitions available for ${args.issueKey}.` }] };
+      }
+      let text = `# Available Transitions for ${args.issueKey}\n\n`;
+      for (const t of transitions) {
+        text += `- **${t.name}** (id: ${t.id}) -> ${t.to?.name || "unknown"}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "jira_unlink_tickets") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForKey(args.issueKey);
+      const issue = await fetchJira(
+        `/issue/${args.issueKey}?fields=issuelinks`,
+        {},
+        inst,
+      );
+      const links = issue.fields?.issuelinks || [];
+      const link = links.find(
+        (l) =>
+          l.inwardIssue?.key === args.linkedIssueKey ||
+          l.outwardIssue?.key === args.linkedIssueKey,
+      );
+      if (!link) {
+        return {
+          content: [{ type: "text", text: `No link found between ${args.issueKey} and ${args.linkedIssueKey}.` }],
+          isError: true,
+        };
+      }
+      await fetchJira(`/issueLink/${link.id}`, { method: "DELETE" }, inst);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Removed link between ${args.issueKey} and ${args.linkedIssueKey}.`,
+          },
+        ],
+      };
+
+    } else if (name === "jira_remove_attachment") {
+      if (args.attachmentId) {
+        const inst = args.instance
+          ? getInstanceByName(args.instance)
+          : (args.issueKey ? getInstanceForKey(args.issueKey) : getInstanceByName(undefined));
+        await fetchJira(`/attachment/${args.attachmentId}`, { method: "DELETE" }, inst);
+        return {
+          content: [{ type: "text", text: `Deleted attachment ${args.attachmentId}.` }],
+        };
+      } else if (args.fileName && args.issueKey) {
+        const inst = args.instance
+          ? getInstanceByName(args.instance)
+          : getInstanceForKey(args.issueKey);
+        const issue = await fetchJira(
+          `/issue/${args.issueKey}?fields=attachment`,
+          {},
+          inst,
+        );
+        const attachments = issue.fields?.attachment || [];
+        const att = attachments.find((a) => a.filename === args.fileName);
+        if (!att) {
+          return {
+            content: [{ type: "text", text: `Attachment "${args.fileName}" not found on ${args.issueKey}.` }],
+            isError: true,
+          };
+        }
+        await fetchJira(`/attachment/${att.id}`, { method: "DELETE" }, inst);
+        return {
+          content: [{ type: "text", text: `Deleted attachment "${args.fileName}" from ${args.issueKey}.` }],
+        };
+      } else {
+        return {
+          content: [{ type: "text", text: "Error: Provide attachmentId, or both issueKey and fileName." }],
+          isError: true,
+        };
+      }
+
+    } else if (name === "jira_add_watcher") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForKey(args.issueKey);
+      await fetchJira(
+        `/issue/${args.issueKey}/watchers`,
+        { method: "POST", body: args.accountId },
+        inst,
+      );
+      return {
+        content: [{ type: "text", text: `Added watcher to ${args.issueKey}.` }],
+      };
+
+    } else if (name === "jira_remove_watcher") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForKey(args.issueKey);
+      await fetchJira(
+        `/issue/${args.issueKey}/watchers?accountId=${encodeURIComponent(args.accountId)}`,
+        { method: "DELETE" },
+        inst,
+      );
+      return {
+        content: [{ type: "text", text: `Removed watcher from ${args.issueKey}.` }],
+      };
+
+    } else if (name === "jira_add_worklog") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForKey(args.issueKey);
+      const body = { timeSpent: args.timeSpent };
+      if (args.started) {
+        body.started = args.started;
+      }
+      if (args.comment) {
+        const adfContent = await buildCommentADF(args.comment, inst);
+        body.comment = {
+          version: 1,
+          type: "doc",
+          content: adfContent,
+        };
+      }
+      const result = await fetchJira(
+        `/issue/${args.issueKey}/worklog`,
+        { method: "POST", body },
+        inst,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Logged ${args.timeSpent} on ${args.issueKey} (worklog ID: ${result.id}).`,
+          },
+        ],
+      };
+
+    } else if (name === "jira_get_worklogs") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForKey(args.issueKey);
+      const result = await fetchJira(`/issue/${args.issueKey}/worklog`, {}, inst);
+      const worklogs = result.worklogs || [];
+      if (worklogs.length === 0) {
+        return { content: [{ type: "text", text: `No work logs for ${args.issueKey}.` }] };
+      }
+      let text = `# Work Logs for ${args.issueKey} (${worklogs.length})\n\n`;
+      for (const w of worklogs) {
+        const author = w.author?.displayName || "Unknown";
+        const date = w.started ? w.started.substring(0, 10) : "N/A";
+        const time = w.timeSpent || "N/A";
+        text += `- **${author}** - ${time} on ${date}`;
+        if (w.comment) {
+          const commentText = typeof w.comment === "string" ? w.comment : extractText(w.comment);
+          if (commentText) text += ` - ${commentText}`;
+        }
+        text += ` (id: ${w.id})\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "jira_clone_ticket") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForKey(args.issueKey);
+      const original = await fetchJira(
+        `/issue/${args.issueKey}?fields=summary,description,priority,labels,components,issuetype,project`,
+        {},
+        inst,
+      );
+      const of = original.fields;
+      const prefix = args.summaryPrefix !== undefined ? args.summaryPrefix : "CLONE - ";
+      const targetProject = args.targetProjectKey || of.project?.key;
+
+      const fields = {
+        project: { key: targetProject },
+        issuetype: { name: of.issuetype?.name || "Task" },
+        summary: `${prefix}${of.summary}`,
+      };
+      if (of.description) {
+        fields.description = of.description;
+      }
+      if (of.priority) {
+        fields.priority = { name: of.priority.name };
+      }
+      if (of.labels?.length > 0) {
+        fields.labels = of.labels;
+      }
+      if (of.components?.length > 0) {
+        fields.components = of.components.map((c) => ({ name: c.name }));
+      }
+
+      const result = await fetchJira("/issue", { method: "POST", body: { fields } }, inst);
+      const newKey = result.key;
+
+      const linkToOriginal = args.linkToOriginal !== false;
+      if (linkToOriginal) {
+        try {
+          await fetchJira("/issueLink", {
+            method: "POST",
+            body: {
+              type: { name: "Cloners" },
+              inwardIssue: { key: newKey },
+              outwardIssue: { key: args.issueKey },
+            },
+          }, inst);
+        } catch {
+          // Link type "Cloners" may not exist, try "Relates"
+          try {
+            await fetchJira("/issueLink", {
+              method: "POST",
+              body: {
+                type: { name: "Relates" },
+                inwardIssue: { key: newKey },
+                outwardIssue: { key: args.issueKey },
+              },
+            }, inst);
+          } catch {
+            // Linking failed, but ticket was created
+          }
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Cloned ${args.issueKey} -> ${newKey}: ${prefix}${of.summary}\nURL: ${inst.baseUrl}/browse/${newKey}`,
+          },
+        ],
+      };
+
+    } else if (name === "jira_move_to_sprint") {
+      const inst = getInstanceByName(args.instance);
+      await fetchJiraAgile(
+        `/sprint/${args.sprintId}/issue`,
+        { method: "POST", body: { issues: args.issueKeys } },
+        inst,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Moved ${args.issueKeys.join(", ")} to sprint ${args.sprintId}.`,
+          },
+        ],
+      };
+
+    } else if (name === "jira_get_sprints") {
+      const inst = getInstanceByName(args.instance);
+      let endpoint = `/board/${args.boardId}/sprint?maxResults=50`;
+      if (args.state) {
+        endpoint += `&state=${encodeURIComponent(args.state)}`;
+      }
+      const result = await fetchJiraAgile(endpoint, {}, inst);
+      const sprints = result.values || [];
+      if (sprints.length === 0) {
+        return { content: [{ type: "text", text: `No sprints found for board ${args.boardId}.` }] };
+      }
+      let text = `# Sprints for Board ${args.boardId} (${sprints.length})\n\n`;
+      for (const s of sprints) {
+        const start = s.startDate ? s.startDate.substring(0, 10) : "N/A";
+        const end = s.endDate ? s.endDate.substring(0, 10) : "N/A";
+        text += `- **${s.name}** (id: ${s.id}) - ${s.state} [${start} to ${end}]\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "jira_get_boards") {
+      const inst = getInstanceByName(args.instance);
+      let endpoint = "/board?maxResults=50";
+      if (args.projectKeyOrId) {
+        endpoint += `&projectKeyOrId=${encodeURIComponent(args.projectKeyOrId)}`;
+      }
+      if (args.name) {
+        endpoint += `&name=${encodeURIComponent(args.name)}`;
+      }
+      if (args.type) {
+        endpoint += `&type=${encodeURIComponent(args.type)}`;
+      }
+      const result = await fetchJiraAgile(endpoint, {}, inst);
+      const boards = result.values || [];
+      if (boards.length === 0) {
+        return { content: [{ type: "text", text: "No boards found." }] };
+      }
+      let text = `# Agile Boards (${boards.length})\n\n`;
+      for (const b of boards) {
+        text += `- **${b.name}** (id: ${b.id}) - ${b.type}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "jira_get_issue_types") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForProject(args.projectKey);
+      const result = await fetchJira(
+        `/issue/createmeta?projectKeys=${encodeURIComponent(args.projectKey)}&expand=projects.issuetypes`,
+        {},
+        inst,
+      );
+      const project = result.projects?.[0];
+      if (!project) {
+        // Fallback: try the newer endpoint
+        const types = await fetchJira(
+          `/issuetype/project?projectId=${encodeURIComponent(args.projectKey)}`,
+          {},
+          inst,
+        );
+        const typeList = Array.isArray(types) ? types : [];
+        if (typeList.length === 0) {
+          return { content: [{ type: "text", text: `No issue types found for project ${args.projectKey}.` }] };
+        }
+        let text = `# Issue Types for ${args.projectKey} (${typeList.length})\n\n`;
+        for (const t of typeList) {
+          text += `- **${t.name}** (id: ${t.id})${t.subtask ? " [subtask]" : ""}${t.description ? ` - ${t.description}` : ""}\n`;
+        }
+        return { content: [{ type: "text", text }] };
+      }
+      const issueTypes = project.issuetypes || [];
+      let text = `# Issue Types for ${args.projectKey} (${issueTypes.length})\n\n`;
+      for (const t of issueTypes) {
+        text += `- **${t.name}** (id: ${t.id})${t.subtask ? " [subtask]" : ""}${t.description ? ` - ${t.description}` : ""}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "jira_get_priorities") {
+      const inst = getInstanceByName(args.instance);
+      const result = await fetchJira("/priority", {}, inst);
+      const priorities = Array.isArray(result) ? result : [];
+      if (priorities.length === 0) {
+        return { content: [{ type: "text", text: "No priorities found." }] };
+      }
+      let text = `# Available Priorities (${priorities.length})\n\n`;
+      for (const p of priorities) {
+        text += `- **${p.name}** (id: ${p.id})${p.description ? ` - ${p.description}` : ""}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "jira_get_components") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForProject(args.projectKey);
+      const result = await fetchJira(
+        `/project/${encodeURIComponent(args.projectKey)}/components`,
+        {},
+        inst,
+      );
+      const components = Array.isArray(result) ? result : [];
+      if (components.length === 0) {
+        return { content: [{ type: "text", text: `No components found for project ${args.projectKey}.` }] };
+      }
+      let text = `# Components for ${args.projectKey} (${components.length})\n\n`;
+      for (const c of components) {
+        const lead = c.lead?.displayName ? ` (lead: ${c.lead.displayName})` : "";
+        text += `- **${c.name}** (id: ${c.id})${lead}${c.description ? ` - ${c.description}` : ""}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "jira_get_versions") {
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForProject(args.projectKey);
+      const result = await fetchJira(
+        `/project/${encodeURIComponent(args.projectKey)}/versions`,
+        {},
+        inst,
+      );
+      const versions = Array.isArray(result) ? result : [];
+      if (versions.length === 0) {
+        return { content: [{ type: "text", text: `No versions found for project ${args.projectKey}.` }] };
+      }
+      let text = `# Versions for ${args.projectKey} (${versions.length})\n\n`;
+      for (const v of versions) {
+        const released = v.released ? " [released]" : "";
+        const archived = v.archived ? " [archived]" : "";
+        const date = v.releaseDate || "";
+        text += `- **${v.name}** (id: ${v.id})${released}${archived}${date ? ` - ${date}` : ""}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
     } else {
       throw new Error(`Unknown tool: ${name}`);
     }
@@ -2188,4 +3518,11 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch(console.error);
+if (require.main === module) {
+  main().catch(console.error);
+}
+
+// Export for testing
+if (typeof module !== "undefined") {
+  module.exports = { buildCommentADF, parseInlineFormatting, findJiraTicketKeys };
+}
