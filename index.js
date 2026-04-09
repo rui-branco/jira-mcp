@@ -1831,7 +1831,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             defaultTeam: {
               type: "string",
-              description: "Default team name to auto-assign when creating tickets (e.g., 'Site Surveys (MODS)'). Resolved and validated via Jira Teams API. Pass empty string to clear.",
+              description: "Default team name to auto-assign when creating tickets (e.g., 'Site Surveys (MODS)'). Resolved and validated via Jira Teams API. Pass 'none' to explicitly disable team prompts. Pass empty string to reset.",
             },
           },
           required: ["name"],
@@ -2895,6 +2895,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args.defaultTeam !== undefined) {
         if (args.defaultTeam === "") {
           defaultTeam = undefined;
+        } else if (args.defaultTeam.toLowerCase() === "none") {
+          defaultTeam = "none";
         } else {
           // Validate team exists via Jira Teams API
           const tempInst = { baseUrl, auth: authStr };
@@ -2968,7 +2970,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       let text = `${action} instance "${instName}" (${baseUrl}).`;
       if (projects.length > 0) text += ` Projects: ${projects.join(", ")}.`;
       if (args.setDefault) text += " Set as default.";
-      if (defaultTeam) {
+      if (defaultTeam === "none") {
+        text += " Default team: None (disabled).";
+      } else if (defaultTeam) {
         text += ` Default team: ${defaultTeam.name}.`;
       } else {
         // No default team — fetch available teams and prompt
@@ -2977,7 +2981,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const teams = await listTeams(tempInst);
           if (teams && teams.length > 0) {
             const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
-            text += `\n\n⚠ No default team configured. Available teams:\n${list}\n0. None\n\nAsk the user which team to set as default. If they pick one, call jira_add_instance with name="${instName}" and defaultTeam="<team name>".`;
+            text += `\n\n⚠ No default team configured. Available teams:\n${list}\n0. None\n\nAsk the user which team to set as default. If they pick one, call jira_add_instance with name="${instName}" and defaultTeam="<team name>". If "None" is selected, call jira_add_instance with defaultTeam="none" to stop future prompts.`;
           }
         } catch {
           // Teams API not available, skip
@@ -3024,11 +3028,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       const currentDefault = rawConfig.defaultInstance || instances[0].name;
       let text = `# Configured Jira Instances (${instances.length})\n\n`;
+      const missingTeam = [];
       for (const inst of instances) {
         const isDefault = inst.name === currentDefault ? " **(default)**" : "";
         const projs = inst.projects?.length > 0 ? `\n  Projects: ${inst.projects.join(", ")}` : "";
-        const team = inst.defaultTeam ? `\n  Default team: ${inst.defaultTeam.name}` : "";
+        const team = inst.defaultTeam === "none" ? "\n  Default team: None (disabled)" : inst.defaultTeam ? `\n  Default team: ${inst.defaultTeam.name}` : "";
         text += `- **${inst.name}**${isDefault}: ${inst.baseUrl} (${inst.email})${projs}${team}\n`;
+        if (!inst.defaultTeam) missingTeam.push(inst);
+      }
+      if (missingTeam.length > 0) {
+        const names = missingTeam.map((i) => `"${i.name}"`).join(", ");
+        text += `\n⚠ Instances without a default team: ${names}.\nAsk the user if they want to configure a default team. To set one, call jira_add_instance with name="<instance>" and defaultTeam="<team name>".`;
       }
       return { content: [{ type: "text", text }] };
 
@@ -3075,15 +3085,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       let teamPrompt = "";
       if (args.team) {
         fields.customfield_10001 = await resolveTeamId(args.team, inst);
-      } else if (inst.defaultTeam) {
+      } else if (inst.defaultTeam && inst.defaultTeam !== "none") {
         fields.customfield_10001 = inst.defaultTeam.id;
-      } else {
+      } else if (!inst.defaultTeam) {
         // No team param and no default — fetch available teams and prompt user
         try {
           const teams = await listTeams(inst);
           if (teams && teams.length > 0) {
             const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
-            teamPrompt = `\n\n⚠ No team assigned and no default team configured for instance "${inst.name}". Available teams:\n${list}\n0. None\n\nTo assign a team to this ticket, call jira_update_ticket with issueKey and team parameter.\nIf a team is selected, ask the user if it should also be saved as the default team for instance "${inst.name}" (via jira_add_instance with defaultTeam).`;
+            teamPrompt = `\n\n⚠ No team assigned and no default team configured for instance "${inst.name}". Available teams:\n${list}\n0. None\n\nTo assign a team to this ticket, call jira_update_ticket with issueKey and team parameter.\nIf a team is selected, ask the user if it should also be saved as the default team for instance "${inst.name}" (via jira_add_instance with defaultTeam). If "None" is selected, call jira_add_instance with defaultTeam="none" to stop future prompts.`;
           }
         } catch {
           // Teams API not available, proceed without team
@@ -3146,7 +3156,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
         if (parentIssue.fields?.customfield_10001) {
           fields.customfield_10001 = parentIssue.fields.customfield_10001;
-        } else if (inst.defaultTeam) {
+        } else if (inst.defaultTeam && inst.defaultTeam !== "none") {
           teamWarning = `\n\nNote: Parent ${args.parentKey} has no team assigned. Instance default team is "${inst.defaultTeam.name}". Use team parameter to assign it.`;
         }
       }
@@ -3497,14 +3507,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       let teamPrompt = "";
       if (of.customfield_10001) {
         fields.customfield_10001 = of.customfield_10001;
-      } else if (inst.defaultTeam) {
+      } else if (inst.defaultTeam && inst.defaultTeam !== "none") {
         fields.customfield_10001 = inst.defaultTeam.id;
-      } else {
+      } else if (!inst.defaultTeam) {
         try {
           const teams = await listTeams(inst);
           if (teams && teams.length > 0) {
             const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
-            teamPrompt = `\n\n⚠ No team assigned (original had none) and no default team configured for instance "${inst.name}". Available teams:\n${list}\n0. None\n\nTo assign a team to this ticket, call jira_update_ticket with issueKey and team parameter.\nIf a team is selected, ask the user if it should also be saved as the default team for instance "${inst.name}" (via jira_add_instance with defaultTeam).`;
+            teamPrompt = `\n\n⚠ No team assigned (original had none) and no default team configured for instance "${inst.name}". Available teams:\n${list}\n0. None\n\nTo assign a team to this ticket, call jira_update_ticket with issueKey and team parameter.\nIf a team is selected, ask the user if it should also be saved as the default team for instance "${inst.name}" (via jira_add_instance with defaultTeam). If "None" is selected, call jira_add_instance with defaultTeam="none" to stop future prompts.`;
           }
         } catch {
           // Teams API not available, proceed without team
