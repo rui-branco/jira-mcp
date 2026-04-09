@@ -126,17 +126,26 @@ async function setup() {
       console.log(`Existing single-instance config found (${existing.baseUrl})\n`);
     } else {
       console.log("Existing instances:");
+      const missingTeam = [];
       for (const inst of existing.instances) {
         const isDefault = inst.name === existing.defaultInstance ? " (default)" : "";
         const projs = inst.projects?.length > 0 ? ` [${inst.projects.join(", ")}]` : "";
-        console.log(`  - ${inst.name}${isDefault}: ${inst.baseUrl}${projs}`);
+        const team = inst.defaultTeam ? ` | Team: ${inst.defaultTeam.name}` : "";
+        console.log(`  - ${inst.name}${isDefault}: ${inst.baseUrl}${projs}${team}`);
+        if (!inst.defaultTeam) missingTeam.push(inst.name);
+      }
+      if (missingTeam.length > 0) {
+        console.log(`\n  ⚠ No default team: ${missingTeam.join(", ")}`);
       }
       console.log();
     }
 
-    const action = await ask("Add new instance, or fresh setup? (add/fresh): ");
-    if (action.trim().toLowerCase() === "fresh") {
+    const action = await ask("Add new instance, set default team, or fresh setup? (add/team/fresh): ");
+    const choice = action.trim().toLowerCase();
+    if (choice === "fresh") {
       // Fall through to single setup
+    } else if (choice === "team") {
+      return await setInstanceTeam(existing);
     } else {
       // Add instance to multi-instance config
       return await addInstance(existing);
@@ -152,11 +161,95 @@ async function setup() {
   const token = await ask("Jira API token: ");
   const baseUrl = await ask("Jira base URL (e.g., https://company.atlassian.net): ");
 
-  saveConfig({ email, token, baseUrl: baseUrl.replace(/\/$/, "") });
+  const config = { email, token, baseUrl: baseUrl.replace(/\/$/, "") };
+  const authStr = Buffer.from(`${email}:${token}`).toString("base64");
+  const team = await pickDefaultTeam(baseUrl.replace(/\/$/, ""), authStr);
+  if (team) config.defaultTeam = team;
+
+  saveConfig(config);
   console.log(`\nConfig saved to ${configPath}`);
 
   printFigmaStatus();
   printSetupComplete();
+  rl.close();
+}
+
+async function pickDefaultTeam(baseUrl, authStr) {
+  console.log("\nFetching available teams from Jira...");
+  try {
+    const response = await fetch(`${baseUrl}/rest/teams/1.0/teams/find?query=&excludeMembers=true`, {
+      headers: {
+        Authorization: `Basic ${authStr}`,
+        Accept: "application/json",
+      },
+    });
+    if (!response.ok) {
+      console.log("Could not fetch teams (API returned " + response.status + "). Skipping team setup.");
+      return null;
+    }
+    const teams = JSON.parse(await response.text());
+    if (!teams || teams.length === 0) {
+      console.log("No teams found. Skipping team setup.");
+      return null;
+    }
+
+    console.log("\nAvailable teams:");
+    for (let i = 0; i < teams.length; i++) {
+      console.log(`  ${i + 1}. ${teams[i].title}`);
+    }
+    const choice = await ask("\nSelect default team number (or press Enter to skip): ");
+    const idx = parseInt(choice, 10) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= teams.length) {
+      console.log("No default team set.");
+      return null;
+    }
+    const selected = teams[idx];
+    const teamObj = { name: selected.title, id: `${selected.organizationId}-${selected.id}` };
+    console.log(`Default team set to: ${teamObj.name}`);
+    return teamObj;
+  } catch (e) {
+    console.log("Could not fetch teams: " + e.message + ". Skipping team setup.");
+    return null;
+  }
+}
+
+async function setInstanceTeam(config) {
+  if (!config.instances || config.instances.length === 0) {
+    console.log("No instances configured.");
+    rl.close();
+    return;
+  }
+
+  let target;
+  if (config.instances.length === 1) {
+    target = config.instances[0];
+    console.log(`\nConfiguring team for "${target.name}"...`);
+  } else {
+    console.log("\nWhich instance?");
+    for (let i = 0; i < config.instances.length; i++) {
+      const inst = config.instances[i];
+      const team = inst.defaultTeam ? ` (current: ${inst.defaultTeam.name})` : " (no team)";
+      console.log(`  ${i + 1}. ${inst.name}${team}`);
+    }
+    const choice = await ask("Select instance number: ");
+    const idx = parseInt(choice, 10) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= config.instances.length) {
+      console.log("Invalid selection.");
+      rl.close();
+      return;
+    }
+    target = config.instances[idx];
+  }
+
+  const authStr = Buffer.from(`${target.email}:${target.token}`).toString("base64");
+  const team = await pickDefaultTeam(target.baseUrl, authStr);
+  if (team) {
+    target.defaultTeam = team;
+    saveConfig(config);
+    console.log(`\nSaved default team "${team.name}" for instance "${target.name}".`);
+  } else {
+    console.log("No changes made.");
+  }
   rl.close();
 }
 
@@ -192,13 +285,18 @@ async function addInstance(config) {
   const projectsInput = await ask("Project prefixes (comma-separated, e.g., SIDE,FUN): ");
   const projects = projectsInput.split(",").map((p) => p.trim().toUpperCase()).filter(Boolean);
 
+  const trimmedBaseUrl = baseUrl.trim().replace(/\/$/, "");
+  const authStr = Buffer.from(`${email.trim()}:${token.trim()}`).toString("base64");
+  const team = await pickDefaultTeam(trimmedBaseUrl, authStr);
+
   const instance = {
     name: name.trim(),
     email: email.trim(),
     token: token.trim(),
-    baseUrl: baseUrl.trim().replace(/\/$/, ""),
+    baseUrl: trimmedBaseUrl,
     projects,
   };
+  if (team) instance.defaultTeam = team;
 
   // Replace or add
   const idx = config.instances.findIndex((i) => i.name === instance.name);

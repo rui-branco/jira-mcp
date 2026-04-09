@@ -55,7 +55,7 @@ require.cache[stdioPath] = {
   exports: { StdioServerTransport: class {} },
 };
 
-const { buildCommentADF, parseInlineFormatting, findJiraTicketKeys } = require("../index.js");
+const { buildCommentADF, parseInlineFormatting, findJiraTicketKeys, resolveTeamId, fetchJiraTeams } = require("../index.js");
 
 // ============ parseInlineFormatting ============
 
@@ -350,5 +350,178 @@ describe("findJiraTicketKeys", () => {
   it("should handle empty/null input", () => {
     assert.deepStrictEqual(findJiraTicketKeys(""), []);
     assert.deepStrictEqual(findJiraTicketKeys(null), []);
+  });
+});
+
+// ============ Team functions ============
+
+describe("resolveTeamId", () => {
+  const testInstance = {
+    name: "test",
+    baseUrl: "https://test.atlassian.net",
+    auth: "dGVzdDp0ZXN0", // base64 "test:test"
+  };
+
+  beforeEach(() => {
+    fetchMock.mock.resetCalls();
+  });
+
+  it("should resolve team name to orgId-id format", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify([
+              { id: 304, title: "Site Surveys (MODS)", organizationId: "c7cef7dd-a0e5-422b-a8b5-af3a63679272" },
+              { id: 100, title: "KONE SiteFlow", organizationId: "c7cef7dd-a0e5-422b-a8b5-af3a63679272" },
+            ]),
+          ),
+      }),
+    );
+
+    const result = await resolveTeamId("Site Surveys (MODS)", testInstance);
+    assert.equal(result, "c7cef7dd-a0e5-422b-a8b5-af3a63679272-304");
+  });
+
+  it("should match team name case-insensitively", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify([
+              { id: 304, title: "Site Surveys (MODS)", organizationId: "org-123" },
+            ]),
+          ),
+      }),
+    );
+
+    const result = await resolveTeamId("site surveys (mods)", testInstance);
+    assert.equal(result, "org-123-304");
+  });
+
+  it("should throw when team not found", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify([
+              { id: 1, title: "Other Team", organizationId: "org-123" },
+            ]),
+          ),
+      }),
+    );
+
+    await assert.rejects(
+      () => resolveTeamId("Nonexistent Team", testInstance),
+      (err) => {
+        assert.ok(err.message.includes('Team "Nonexistent Team" not found'));
+        assert.ok(err.message.includes("Other Team"));
+        return true;
+      },
+    );
+  });
+
+  it("should throw with empty similar list when no teams returned", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify([])),
+      }),
+    );
+
+    await assert.rejects(
+      () => resolveTeamId("Any Team", testInstance),
+      (err) => {
+        assert.ok(err.message.includes('Team "Any Team" not found'));
+        return true;
+      },
+    );
+  });
+
+  it("should call the correct Teams API endpoint", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify([
+              { id: 1, title: "My Team", organizationId: "org-1" },
+            ]),
+          ),
+      }),
+    );
+
+    await resolveTeamId("My Team", testInstance);
+
+    const call = fetchMock.mock.calls[0];
+    const url = call.arguments[0];
+    assert.ok(url.startsWith("https://test.atlassian.net/rest/teams/1.0/teams/find"));
+    assert.ok(url.includes("query=My%20Team"));
+    assert.ok(url.includes("excludeMembers=true"));
+  });
+});
+
+describe("fetchJiraTeams", () => {
+  const testInstance = {
+    name: "test",
+    baseUrl: "https://test.atlassian.net",
+    auth: "dGVzdDp0ZXN0",
+  };
+
+  beforeEach(() => {
+    fetchMock.mock.resetCalls();
+  });
+
+  it("should call the Teams REST API with correct base URL", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify([{ id: 1, title: "Team A" }])),
+      }),
+    );
+
+    const result = await fetchJiraTeams("/teams/find?query=&excludeMembers=true", {}, testInstance);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].title, "Team A");
+
+    const url = fetchMock.mock.calls[0].arguments[0];
+    assert.equal(url, "https://test.atlassian.net/rest/teams/1.0/teams/find?query=&excludeMembers=true");
+  });
+
+  it("should pass auth header", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve("[]"),
+      }),
+    );
+
+    await fetchJiraTeams("/teams/find?query=", {}, testInstance);
+
+    const headers = fetchMock.mock.calls[0].arguments[1].headers;
+    assert.equal(headers.Authorization, "Basic dGVzdDp0ZXN0");
+  });
+
+  it("should throw on API error", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: false,
+        status: 403,
+        statusText: "Forbidden",
+        text: () => Promise.resolve("Access denied"),
+      }),
+    );
+
+    await assert.rejects(
+      () => fetchJiraTeams("/teams/find?query=", {}, testInstance),
+      (err) => {
+        assert.ok(err.message.includes("403"));
+        assert.ok(err.message.includes("Forbidden"));
+        return true;
+      },
+    );
   });
 });

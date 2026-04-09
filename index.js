@@ -184,6 +184,48 @@ async function fetchJiraAgile(endpoint, options = {}, instance = defaultInstance
   return text ? JSON.parse(text) : {};
 }
 
+async function fetchJiraTeams(endpoint, options = {}, instance = defaultInstance) {
+  const { method = "GET", body } = options;
+  const headers = {
+    Authorization: `Basic ${instance.auth}`,
+    Accept: "application/json",
+  };
+  if (body) {
+    headers["Content-Type"] = "application/json";
+  }
+  const response = await fetch(`${instance.baseUrl}/rest/teams/1.0${endpoint}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => "");
+    throw new Error(
+      `Jira Teams API error: ${response.status} ${response.statusText}${errorBody ? ` - ${errorBody}` : ""}`,
+    );
+  }
+  const text = await response.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function resolveTeamId(teamName, instance) {
+  const teams = await fetchJiraTeams(
+    `/teams/find?query=${encodeURIComponent(teamName)}&excludeMembers=true`,
+    {},
+    instance,
+  );
+  const match = teams.find(
+    (t) => t.title.toLowerCase() === teamName.toLowerCase(),
+  );
+  if (!match) {
+    const available = teams.map((t) => t.title).join(", ");
+    throw new Error(
+      `Team "${teamName}" not found.${available ? ` Similar teams: ${available}` : ""}`,
+    );
+  }
+  return `${match.organizationId}-${match.id}`;
+}
+
 async function downloadAttachment(url, filename, issueKey, instance) {
   const issueDir = path.join(attachmentDir, issueKey);
   if (!fs.existsSync(issueDir)) {
@@ -847,6 +889,13 @@ async function getTicket(issueKey, downloadImages = true, fetchFigma = true, ins
   if (fields.updated) output += `**Updated:** ${fields.updated}\n`;
   if (fields.resolutiondate) output += `**Resolved:** ${fields.resolutiondate}\n`;
   if (fields.resolution) output += `**Resolution:** ${fields.resolution.name}\n`;
+
+  // Team
+  if (fields.customfield_10001) {
+    const teamVal = fields.customfield_10001;
+    const teamName = typeof teamVal === "object" ? teamVal.name || teamVal.title || teamVal.value || JSON.stringify(teamVal) : teamVal;
+    output += `**Team:** ${teamName}\n`;
+  }
 
   // Story points
   if (storyPoints != null) output += `**Story Points:** ${storyPoints}\n`;
@@ -1646,6 +1695,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: { type: "string" },
               description: "Labels to set on the ticket",
             },
+            team: {
+              type: "string",
+              description: "Team name to assign (e.g., 'Site Surveys (MODS)'). Resolved automatically via Jira Teams API.",
+            },
             instance: {
               type: "string",
               description: "Instance name override. Auto-detected from issue key prefix if omitted.",
@@ -1740,6 +1793,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "boolean",
               description: "Set this instance as the default (default: false)",
             },
+            defaultTeam: {
+              type: "string",
+              description: "Default team name to auto-assign when creating tickets (e.g., 'Site Surveys (MODS)'). Resolved and validated via Jira Teams API. Pass empty string to clear.",
+            },
           },
           required: ["name"],
         },
@@ -1827,6 +1884,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description: "Sprint ID to add the ticket to. Use jira_get_sprints to find sprint IDs.",
             },
+            team: {
+              type: "string",
+              description: "Team name to assign (e.g., 'Site Surveys (MODS)'). Resolved automatically via Jira Teams API.",
+            },
             instance: {
               type: "string",
               description: "Instance name override. Auto-detected from project key if omitted.",
@@ -1866,6 +1927,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "array",
               items: { type: "string" },
               description: "Labels to set on the subtask",
+            },
+            team: {
+              type: "string",
+              description: "Team name to assign (e.g., 'Site Surveys (MODS)'). Resolved automatically via Jira Teams API.",
             },
             instance: {
               type: "string",
@@ -2733,6 +2798,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args.labels) {
         fields.labels = args.labels;
       }
+      if (args.team) {
+        fields.customfield_10001 = await resolveTeamId(args.team, inst);
+      }
 
       if (Object.keys(fields).length === 0) {
         return {
@@ -2786,7 +2854,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const projects = args.projects ? args.projects.map((p) => p.toUpperCase()) : (existing.projects || []);
       const authStr = Buffer.from(`${email}:${token}`).toString("base64");
 
-      const newInstance = { name: instName, email, token, baseUrl, projects, auth: authStr };
+      // Resolve defaultTeam if provided
+      let defaultTeam = existing.defaultTeam || undefined;
+      if (args.defaultTeam !== undefined) {
+        if (args.defaultTeam === "") {
+          defaultTeam = undefined;
+        } else {
+          // Validate team exists via Jira Teams API
+          const tempInst = { baseUrl, auth: authStr };
+          try {
+            const teamId = await resolveTeamId(args.defaultTeam, tempInst);
+            defaultTeam = { name: args.defaultTeam, id: teamId };
+          } catch (e) {
+            // Try to list available teams for a helpful error
+            try {
+              const teams = await fetchJiraTeams(
+                `/teams/find?query=&excludeMembers=true`,
+                {},
+                tempInst,
+              );
+              const available = teams.map((t) => t.title).join(", ");
+              return {
+                content: [{ type: "text", text: `Team "${args.defaultTeam}" not found. Available teams: ${available}` }],
+                isError: true,
+              };
+            } catch {
+              return {
+                content: [{ type: "text", text: e.message }],
+                isError: true,
+              };
+            }
+          }
+        }
+      }
+
+      const newInstance = { name: instName, email, token, baseUrl, projects, auth: authStr, defaultTeam };
 
       // Update in-memory instances
       if (isUpdate) {
@@ -2818,6 +2920,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       // Save without the computed auth field
       const toSave = { name: instName, email, token, baseUrl, projects };
+      if (defaultTeam) toSave.defaultTeam = defaultTeam;
       const savedIdx = savedConfig.instances.findIndex((i) => i.name === instName);
       if (savedIdx >= 0) {
         savedConfig.instances[savedIdx] = toSave;
@@ -2833,6 +2936,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       let text = `${action} instance "${instName}" (${baseUrl}).`;
       if (projects.length > 0) text += ` Projects: ${projects.join(", ")}.`;
       if (args.setDefault) text += " Set as default.";
+      if (defaultTeam) {
+        text += ` Default team: ${defaultTeam.name}.`;
+      } else {
+        // No default team — fetch available teams and prompt
+        try {
+          const tempInst = { baseUrl, auth: authStr };
+          const teams = await fetchJiraTeams(
+            `/teams/find?query=&excludeMembers=true`, {}, tempInst,
+          );
+          if (teams && teams.length > 0) {
+            const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
+            text += `\n\n⚠ No default team configured. Available teams:\n${list}\n0. None\n\nAsk the user which team to set as default. If they pick one, call jira_add_instance with name="${instName}" and defaultTeam="<team name>".`;
+          }
+        } catch {
+          // Teams API not available, skip
+        }
+      }
 
       return { content: [{ type: "text", text }] };
 
@@ -2877,7 +2997,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       for (const inst of instances) {
         const isDefault = inst.name === currentDefault ? " **(default)**" : "";
         const projs = inst.projects?.length > 0 ? `\n  Projects: ${inst.projects.join(", ")}` : "";
-        text += `- **${inst.name}**${isDefault}: ${inst.baseUrl} (${inst.email})${projs}\n`;
+        const team = inst.defaultTeam ? `\n  Default team: ${inst.defaultTeam.name}` : "";
+        text += `- **${inst.name}**${isDefault}: ${inst.baseUrl} (${inst.email})${projs}${team}\n`;
       }
       return { content: [{ type: "text", text }] };
 
@@ -2921,6 +3042,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args.parentKey) {
         fields.parent = { key: args.parentKey };
       }
+      let teamPrompt = "";
+      if (args.team) {
+        fields.customfield_10001 = await resolveTeamId(args.team, inst);
+      } else if (inst.defaultTeam) {
+        fields.customfield_10001 = inst.defaultTeam.id;
+      } else {
+        // No team param and no default — fetch available teams and prompt user
+        try {
+          const teams = await fetchJiraTeams(
+            `/teams/find?query=&excludeMembers=true`, {}, inst,
+          );
+          if (teams && teams.length > 0) {
+            const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
+            teamPrompt = `\n\n⚠ No team assigned and no default team configured for instance "${inst.name}". Available teams:\n${list}\n0. None\n\nTo assign a team to this ticket, call jira_update_ticket with issueKey and team parameter.\nIf a team is selected, ask the user if it should also be saved as the default team for instance "${inst.name}" (via jira_add_instance with defaultTeam).`;
+          }
+        } catch {
+          // Teams API not available, proceed without team
+        }
+      }
 
       const result = await fetchJira("/issue", { method: "POST", body: { fields } }, inst);
       const newKey = result.key;
@@ -2935,6 +3075,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       let text = `Created ${newKey}: ${args.summary}\nURL: ${inst.baseUrl}/browse/${newKey}`;
       if (args.sprintId) text += `\nAdded to sprint ${args.sprintId}.`;
+      text += teamPrompt;
       return { content: [{ type: "text", text }] };
 
     } else if (name === "jira_create_subtask") {
@@ -2967,6 +3108,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args.labels) {
         fields.labels = args.labels;
       }
+      let teamWarning = "";
+      if (args.team) {
+        fields.customfield_10001 = await resolveTeamId(args.team, inst);
+      } else {
+        // Inherit team from parent ticket
+        const parentIssue = await fetchJira(
+          `/issue/${args.parentKey}?fields=customfield_10001`, {}, inst,
+        );
+        if (parentIssue.fields?.customfield_10001) {
+          fields.customfield_10001 = parentIssue.fields.customfield_10001;
+        } else if (inst.defaultTeam) {
+          teamWarning = `\n\nNote: Parent ${args.parentKey} has no team assigned. Instance default team is "${inst.defaultTeam.name}". Use team parameter to assign it.`;
+        }
+      }
 
       const result = await fetchJira("/issue", { method: "POST", body: { fields } }, inst);
       const newKey = result.key;
@@ -2974,7 +3129,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: `Created subtask ${newKey} under ${args.parentKey}: ${args.summary}\nURL: ${inst.baseUrl}/browse/${newKey}`,
+            text: `Created subtask ${newKey} under ${args.parentKey}: ${args.summary}\nURL: ${inst.baseUrl}/browse/${newKey}${teamWarning}`,
           },
         ],
       };
@@ -3286,7 +3441,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ? getInstanceByName(args.instance)
         : getInstanceForKey(args.issueKey);
       const original = await fetchJira(
-        `/issue/${args.issueKey}?fields=summary,description,priority,labels,components,issuetype,project`,
+        `/issue/${args.issueKey}?fields=summary,description,priority,labels,components,issuetype,project,customfield_10001`,
         {},
         inst,
       );
@@ -3310,6 +3465,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       if (of.components?.length > 0) {
         fields.components = of.components.map((c) => ({ name: c.name }));
+      }
+      let teamPrompt = "";
+      if (of.customfield_10001) {
+        fields.customfield_10001 = of.customfield_10001;
+      } else if (inst.defaultTeam) {
+        fields.customfield_10001 = inst.defaultTeam.id;
+      } else {
+        try {
+          const teams = await fetchJiraTeams(
+            `/teams/find?query=&excludeMembers=true`, {}, inst,
+          );
+          if (teams && teams.length > 0) {
+            const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
+            teamPrompt = `\n\n⚠ No team assigned (original had none) and no default team configured for instance "${inst.name}". Available teams:\n${list}\n0. None\n\nTo assign a team to this ticket, call jira_update_ticket with issueKey and team parameter.\nIf a team is selected, ask the user if it should also be saved as the default team for instance "${inst.name}" (via jira_add_instance with defaultTeam).`;
+          }
+        } catch {
+          // Teams API not available, proceed without team
+        }
       }
 
       const result = await fetchJira("/issue", { method: "POST", body: { fields } }, inst);
@@ -3347,7 +3520,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: `Cloned ${args.issueKey} -> ${newKey}: ${prefix}${of.summary}\nURL: ${inst.baseUrl}/browse/${newKey}`,
+            text: `Cloned ${args.issueKey} -> ${newKey}: ${prefix}${of.summary}\nURL: ${inst.baseUrl}/browse/${newKey}${teamPrompt}`,
           },
         ],
       };
@@ -3521,5 +3694,5 @@ if (require.main === module) {
 
 // Export for testing
 if (typeof module !== "undefined") {
-  module.exports = { buildCommentADF, parseInlineFormatting, findJiraTicketKeys };
+  module.exports = { buildCommentADF, parseInlineFormatting, findJiraTicketKeys, resolveTeamId, fetchJiraTeams };
 }
