@@ -1477,7 +1477,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_add_comment",
         description:
-          "Add a comment to a Jira ticket. IMPORTANT: Use @DisplayName (e.g. @Julia Pereszta) for mentions — NOT [~accountId:...] syntax. Keep comments non-technical and user-facing. Never mention git details like 'pushed to main', branch names, or technical implementation details — stakeholders don't care about that. NEVER use em dashes (—) or en dashes (–) in comments — use commas, periods, or rewrite the sentence instead.",
+          "Add a comment to a Jira ticket. IMPORTANT RULES: (1) Write comments at a HIGH LEVEL for stakeholders, product owners, and managers. Focus on WHAT was done and the business impact, NOT how it was done. Example: 'Implemented the new filtering feature for the dashboard' instead of 'Added a useEffect hook with debounced API calls to filter endpoint'. (2) NEVER mention technical details: no code, no function names, no file paths, no git branches, no commit hashes, no 'pushed to main', no framework-specific terms (React, Angular, hooks, components, etc.). (3) Use @DisplayName (e.g. @Julia Pereszta) for mentions, NOT [~accountId:...] syntax. (4) NEVER use em dashes (—) or en dashes (–), use commas, periods, or rewrite the sentence instead.",
         inputSchema: {
           type: "object",
           properties: {
