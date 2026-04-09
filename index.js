@@ -1863,6 +1863,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "jira_get_teams",
+        description:
+          "Search for available Jira teams by name. Returns matching teams with their IDs. Use this to find a team before setting it as default or assigning to a ticket. IMPORTANT: You MUST display the results in your chat response so the user can see them.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Search term to filter teams (e.g., 'site', 'mods'). Leave empty to list all available teams (may be partial).",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name. Uses default instance if omitted.",
+            },
+          },
+          required: [],
+        },
+      },
+      {
         name: "jira_create_ticket",
         description:
           "Create a new Jira issue (story, task, bug, epic, etc.). Returns the new issue key and URL. Use jira_search_users to get account IDs for assignee. NEVER use em dashes or en dashes in text fields.",
@@ -3041,6 +3060,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         text += `\n⚠ Instances without a default team: ${names}.\nAsk the user if they want to configure a default team. To set one, call jira_add_instance with name="<instance>" and defaultTeam="<team name>".`;
       }
       return { content: [{ type: "text", text }] };
+
+    } else if (name === "jira_get_teams") {
+      const inst = args.instance ? getInstanceByName(args.instance) : defaultInstance;
+      const query = args.query || "";
+      const teams = await searchTeamsViaJql(query, inst);
+      if (teams.length === 0) {
+        return { content: [{ type: "text", text: `No teams found${query ? ` matching "${query}"` : ""}.` }] };
+      }
+      teams.sort((a, b) => a.title.localeCompare(b.title));
+      const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
+      return {
+        content: [{ type: "text", text: `Found ${teams.length} team(s)${query ? ` matching "${query}"` : ""}:\n\n0. None\n${list}\n\nIMPORTANT: Display this list in chat so the user can see it. To set as default team, call jira_add_instance with defaultTeam="<team name>". To assign to a ticket, use team parameter on jira_create_ticket or jira_update_ticket.` }],
+      };
 
     } else if (name === "jira_create_ticket") {
       const inst = args.instance
