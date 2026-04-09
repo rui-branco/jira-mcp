@@ -1831,7 +1831,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             defaultTeam: {
               type: "string",
-              description: "Default team name to auto-assign when creating tickets (e.g., 'Site Surveys (MODS)'). Resolved and validated via Jira Teams API. Pass 'none' to explicitly disable team prompts. Pass empty string to reset.",
+              description: "Default team name to auto-assign when creating tickets (e.g., 'Site Surveys (MODS)'). Resolved and validated via Jira Teams API. Pass 'none' to explicitly disable team prompts. Pass empty string to reset. This is the instance-wide fallback.",
+            },
+            projectKey: {
+              type: "string",
+              description: "Project key to set a project-specific team for (e.g., 'FRFSD'). Must be used together with projectTeam.",
+            },
+            projectTeam: {
+              type: "string",
+              description: "Team name for the specific project (set via projectKey). Overrides the instance defaultTeam for that project. Pass 'none' to disable team for this project. Pass empty string to remove the override.",
             },
           },
           required: ["name"],
@@ -2941,7 +2949,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      const newInstance = { name: instName, email, token, baseUrl, projects, auth: authStr, defaultTeam };
+      // Resolve projectTeam if provided
+      let projectTeams = existing.projectTeams || {};
+      if (args.projectKey && args.projectTeam !== undefined) {
+        const pk = args.projectKey.toUpperCase();
+        if (args.projectTeam === "") {
+          delete projectTeams[pk];
+        } else if (args.projectTeam.toLowerCase() === "none") {
+          projectTeams[pk] = "none";
+        } else {
+          const tempInst = { baseUrl, auth: authStr };
+          try {
+            const teamId = await resolveTeamId(args.projectTeam, tempInst);
+            projectTeams[pk] = { name: args.projectTeam, id: teamId };
+          } catch (e) {
+            return {
+              content: [{ type: "text", text: e.message }],
+              isError: true,
+            };
+          }
+        }
+      }
+
+      const newInstance = { name: instName, email, token, baseUrl, projects, auth: authStr, defaultTeam, projectTeams };
 
       // Update in-memory instances
       if (isUpdate) {
@@ -2974,6 +3004,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Save without the computed auth field
       const toSave = { name: instName, email, token, baseUrl, projects };
       if (defaultTeam) toSave.defaultTeam = defaultTeam;
+      if (Object.keys(projectTeams).length > 0) toSave.projectTeams = projectTeams;
       const savedIdx = savedConfig.instances.findIndex((i) => i.name === instName);
       if (savedIdx >= 0) {
         savedConfig.instances[savedIdx] = toSave;
@@ -2989,6 +3020,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       let text = `${action} instance "${instName}" (${baseUrl}).`;
       if (projects.length > 0) text += ` Projects: ${projects.join(", ")}.`;
       if (args.setDefault) text += " Set as default.";
+      if (args.projectKey && args.projectTeam !== undefined) {
+        const pk = args.projectKey.toUpperCase();
+        const pt = projectTeams[pk];
+        if (pt === "none") {
+          text += ` Project ${pk} team: None (disabled).`;
+        } else if (pt) {
+          text += ` Project ${pk} team: ${pt.name}.`;
+        } else {
+          text += ` Project ${pk} team override removed.`;
+        }
+      }
       if (defaultTeam === "none") {
         text += " Default team: None (disabled).";
       } else if (defaultTeam) {
@@ -3052,7 +3094,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const isDefault = inst.name === currentDefault ? " **(default)**" : "";
         const projs = inst.projects?.length > 0 ? `\n  Projects: ${inst.projects.join(", ")}` : "";
         const team = inst.defaultTeam === "none" ? "\n  Default team: None (disabled)" : inst.defaultTeam ? `\n  Default team: ${inst.defaultTeam.name}` : "";
-        text += `- **${inst.name}**${isDefault}: ${inst.baseUrl} (${inst.email})${projs}${team}\n`;
+        let projTeams = "";
+        if (inst.projectTeams && Object.keys(inst.projectTeams).length > 0) {
+          for (const [pk, pt] of Object.entries(inst.projectTeams)) {
+            const ptName = pt === "none" ? "None (disabled)" : pt.name;
+            projTeams += `\n  ${pk} team: ${ptName}`;
+          }
+        }
+        text += `- **${inst.name}**${isDefault}: ${inst.baseUrl} (${inst.email})${projs}${team}${projTeams}\n`;
         if (!inst.defaultTeam) missingTeam.push(inst);
       }
       if (missingTeam.length > 0) {
@@ -3115,8 +3164,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         fields.parent = { key: args.parentKey };
       }
       let teamPrompt = "";
+      const projKey = args.projectKey.toUpperCase();
+      const projTeam = inst.projectTeams?.[projKey];
       if (args.team) {
         fields.customfield_10001 = await resolveTeamId(args.team, inst);
+      } else if (projTeam && projTeam !== "none") {
+        // Project-specific team override
+        fields.customfield_10001 = projTeam.id;
+      } else if (projTeam === "none") {
+        // Project explicitly set to no team — skip silently
       } else if (inst.defaultTeam && inst.defaultTeam !== "none") {
         fields.customfield_10001 = inst.defaultTeam.id;
       } else if (!inst.defaultTeam) {
@@ -3537,8 +3593,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         fields.components = of.components.map((c) => ({ name: c.name }));
       }
       let teamPrompt = "";
+      const cloneProjTeam = inst.projectTeams?.[targetProject?.toUpperCase()];
       if (of.customfield_10001) {
         fields.customfield_10001 = of.customfield_10001;
+      } else if (cloneProjTeam && cloneProjTeam !== "none") {
+        fields.customfield_10001 = cloneProjTeam.id;
+      } else if (cloneProjTeam === "none") {
+        // Project explicitly set to no team
       } else if (inst.defaultTeam && inst.defaultTeam !== "none") {
         fields.customfield_10001 = inst.defaultTeam.id;
       } else if (!inst.defaultTeam) {
