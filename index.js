@@ -208,22 +208,58 @@ async function fetchJiraTeams(endpoint, options = {}, instance = defaultInstance
   return text ? JSON.parse(text) : {};
 }
 
-async function resolveTeamId(teamName, instance) {
-  const teams = await fetchJiraTeams(
-    `/teams/find?query=${encodeURIComponent(teamName)}&excludeMembers=true`,
+async function searchTeamsViaJql(query, instance) {
+  const data = await fetchJira(
+    `/jql/autocompletedata/suggestions?fieldName=cf[10001]&fieldValue=${encodeURIComponent(query)}`,
     {},
     instance,
   );
-  const match = teams.find(
+  return (data.results || []).map((r) => ({
+    title: r.displayName.replace(/<[^>]*>/g, "").replace(/&amp;/g, "&"),
+    id: r.value,
+  }));
+}
+
+async function listTeams(instance) {
+  // Try Teams API first, fall back to JQL autocomplete
+  try {
+    const teams = await fetchJiraTeams(
+      `/teams/find?query=&excludeMembers=true`, {}, instance,
+    );
+    return teams.map((t) => ({ title: t.title, id: `${t.organizationId}-${t.id}` }));
+  } catch {
+    // Teams API not available, use JQL autocomplete with a broad search
+    return searchTeamsViaJql("", instance);
+  }
+}
+
+async function resolveTeamId(teamName, instance) {
+  // Try Teams API first
+  try {
+    const teams = await fetchJiraTeams(
+      `/teams/find?query=${encodeURIComponent(teamName)}&excludeMembers=true`,
+      {},
+      instance,
+    );
+    const match = teams.find(
+      (t) => t.title.toLowerCase() === teamName.toLowerCase(),
+    );
+    if (match) return `${match.organizationId}-${match.id}`;
+  } catch {
+    // Teams API not available, fall through to JQL
+  }
+
+  // Fallback: JQL autocomplete
+  const jqlTeams = await searchTeamsViaJql(teamName, instance);
+  const match = jqlTeams.find(
     (t) => t.title.toLowerCase() === teamName.toLowerCase(),
   );
-  if (!match) {
-    const available = teams.map((t) => t.title).join(", ");
-    throw new Error(
-      `Team "${teamName}" not found.${available ? ` Similar teams: ${available}` : ""}`,
-    );
-  }
-  return `${match.organizationId}-${match.id}`;
+  if (match) return match.id;
+
+  const available = jqlTeams.map((t) => t.title).join(", ");
+  throw new Error(
+    `Team "${teamName}" not found.${available ? ` Similar teams: ${available}` : ""}`,
+  );
 }
 
 async function downloadAttachment(url, filename, issueKey, instance) {
@@ -2868,11 +2904,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           } catch (e) {
             // Try to list available teams for a helpful error
             try {
-              const teams = await fetchJiraTeams(
-                `/teams/find?query=&excludeMembers=true`,
-                {},
-                tempInst,
-              );
+              const teams = await listTeams(tempInst);
               const available = teams.map((t) => t.title).join(", ");
               return {
                 content: [{ type: "text", text: `Team "${args.defaultTeam}" not found. Available teams: ${available}` }],
@@ -2942,9 +2974,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // No default team — fetch available teams and prompt
         try {
           const tempInst = { baseUrl, auth: authStr };
-          const teams = await fetchJiraTeams(
-            `/teams/find?query=&excludeMembers=true`, {}, tempInst,
-          );
+          const teams = await listTeams(tempInst);
           if (teams && teams.length > 0) {
             const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
             text += `\n\n⚠ No default team configured. Available teams:\n${list}\n0. None\n\nAsk the user which team to set as default. If they pick one, call jira_add_instance with name="${instName}" and defaultTeam="<team name>".`;
@@ -3050,9 +3080,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       } else {
         // No team param and no default — fetch available teams and prompt user
         try {
-          const teams = await fetchJiraTeams(
-            `/teams/find?query=&excludeMembers=true`, {}, inst,
-          );
+          const teams = await listTeams(inst);
           if (teams && teams.length > 0) {
             const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
             teamPrompt = `\n\n⚠ No team assigned and no default team configured for instance "${inst.name}". Available teams:\n${list}\n0. None\n\nTo assign a team to this ticket, call jira_update_ticket with issueKey and team parameter.\nIf a team is selected, ask the user if it should also be saved as the default team for instance "${inst.name}" (via jira_add_instance with defaultTeam).`;
@@ -3473,9 +3501,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         fields.customfield_10001 = inst.defaultTeam.id;
       } else {
         try {
-          const teams = await fetchJiraTeams(
-            `/teams/find?query=&excludeMembers=true`, {}, inst,
-          );
+          const teams = await listTeams(inst);
           if (teams && teams.length > 0) {
             const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
             teamPrompt = `\n\n⚠ No team assigned (original had none) and no default team configured for instance "${inst.name}". Available teams:\n${list}\n0. None\n\nTo assign a team to this ticket, call jira_update_ticket with issueKey and team parameter.\nIf a team is selected, ask the user if it should also be saved as the default team for instance "${inst.name}" (via jira_add_instance with defaultTeam).`;
@@ -3694,5 +3720,5 @@ if (require.main === module) {
 
 // Export for testing
 if (typeof module !== "undefined") {
-  module.exports = { buildCommentADF, parseInlineFormatting, findJiraTicketKeys, resolveTeamId, fetchJiraTeams };
+  module.exports = { buildCommentADF, parseInlineFormatting, findJiraTicketKeys, resolveTeamId, fetchJiraTeams, listTeams, searchTeamsViaJql };
 }

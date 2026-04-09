@@ -55,7 +55,7 @@ require.cache[stdioPath] = {
   exports: { StdioServerTransport: class {} },
 };
 
-const { buildCommentADF, parseInlineFormatting, findJiraTicketKeys, resolveTeamId, fetchJiraTeams } = require("../index.js");
+const { buildCommentADF, parseInlineFormatting, findJiraTicketKeys, resolveTeamId, fetchJiraTeams, listTeams, searchTeamsViaJql } = require("../index.js");
 
 // ============ parseInlineFormatting ============
 
@@ -401,18 +401,59 @@ describe("resolveTeamId", () => {
     assert.equal(result, "org-123-304");
   });
 
-  it("should throw when team not found", async () => {
-    fetchMock.mock.mockImplementation(() =>
-      Promise.resolve({
+  it("should fall back to JQL when Teams API fails", async () => {
+    let callCount = 0;
+    fetchMock.mock.mockImplementation((url) => {
+      callCount++;
+      if (url.includes("/rest/teams/")) {
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          statusText: "Not Found",
+          text: () => Promise.resolve("Not Found"),
+        });
+      }
+      // JQL autocomplete fallback
+      return Promise.resolve({
         ok: true,
         text: () =>
           Promise.resolve(
-            JSON.stringify([
-              { id: 1, title: "Other Team", organizationId: "org-123" },
-            ]),
+            JSON.stringify({
+              results: [
+                { value: "org-123-304", displayName: "<b>Site</b> Surveys (MODS)" },
+              ],
+            }),
           ),
-      }),
-    );
+      });
+    });
+
+    const result = await resolveTeamId("Site Surveys (MODS)", testInstance);
+    assert.equal(result, "org-123-304");
+    assert.ok(callCount >= 2); // Teams API + JQL fallback
+  });
+
+  it("should throw when team not found in both APIs", async () => {
+    fetchMock.mock.mockImplementation((url) => {
+      if (url.includes("/rest/teams/")) {
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          statusText: "Not Found",
+          text: () => Promise.resolve("Not Found"),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              results: [
+                { value: "org-1", displayName: "Other Team" },
+              ],
+            }),
+          ),
+      });
+    });
 
     await assert.rejects(
       () => resolveTeamId("Nonexistent Team", testInstance),
@@ -424,24 +465,7 @@ describe("resolveTeamId", () => {
     );
   });
 
-  it("should throw with empty similar list when no teams returned", async () => {
-    fetchMock.mock.mockImplementation(() =>
-      Promise.resolve({
-        ok: true,
-        text: () => Promise.resolve(JSON.stringify([])),
-      }),
-    );
-
-    await assert.rejects(
-      () => resolveTeamId("Any Team", testInstance),
-      (err) => {
-        assert.ok(err.message.includes('Team "Any Team" not found'));
-        return true;
-      },
-    );
-  });
-
-  it("should call the correct Teams API endpoint", async () => {
+  it("should call the correct Teams API endpoint first", async () => {
     fetchMock.mock.mockImplementation(() =>
       Promise.resolve({
         ok: true,
@@ -461,6 +485,133 @@ describe("resolveTeamId", () => {
     assert.ok(url.startsWith("https://test.atlassian.net/rest/teams/1.0/teams/find"));
     assert.ok(url.includes("query=My%20Team"));
     assert.ok(url.includes("excludeMembers=true"));
+  });
+});
+
+describe("searchTeamsViaJql", () => {
+  const testInstance = {
+    name: "test",
+    baseUrl: "https://test.atlassian.net",
+    auth: "dGVzdDp0ZXN0",
+  };
+
+  beforeEach(() => {
+    fetchMock.mock.resetCalls();
+  });
+
+  it("should parse JQL autocomplete results and strip HTML", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              results: [
+                { value: "org-304", displayName: "<b>Site</b> Surveys (MODS)" },
+                { value: "org-100", displayName: "KONE <b>Site</b>Flow" },
+              ],
+            }),
+          ),
+      }),
+    );
+
+    const result = await searchTeamsViaJql("site", testInstance);
+    assert.equal(result.length, 2);
+    assert.equal(result[0].title, "Site Surveys (MODS)");
+    assert.equal(result[0].id, "org-304");
+    assert.equal(result[1].title, "KONE SiteFlow");
+  });
+
+  it("should decode HTML entities", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              results: [
+                { value: "id-1", displayName: "Cars &amp; Doors" },
+              ],
+            }),
+          ),
+      }),
+    );
+
+    const result = await searchTeamsViaJql("cars", testInstance);
+    assert.equal(result[0].title, "Cars & Doors");
+  });
+
+  it("should return empty array when no results", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ results: [] })),
+      }),
+    );
+
+    const result = await searchTeamsViaJql("nothing", testInstance);
+    assert.deepStrictEqual(result, []);
+  });
+});
+
+describe("listTeams", () => {
+  const testInstance = {
+    name: "test",
+    baseUrl: "https://test.atlassian.net",
+    auth: "dGVzdDp0ZXN0",
+  };
+
+  beforeEach(() => {
+    fetchMock.mock.resetCalls();
+  });
+
+  it("should use Teams API when available", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify([
+              { id: 1, title: "Team A", organizationId: "org-1" },
+              { id: 2, title: "Team B", organizationId: "org-1" },
+            ]),
+          ),
+      }),
+    );
+
+    const result = await listTeams(testInstance);
+    assert.equal(result.length, 2);
+    assert.equal(result[0].title, "Team A");
+    assert.equal(result[0].id, "org-1-1");
+  });
+
+  it("should fall back to JQL when Teams API fails", async () => {
+    fetchMock.mock.mockImplementation((url) => {
+      if (url.includes("/rest/teams/")) {
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          statusText: "Not Found",
+          text: () => Promise.resolve("Not Found"),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              results: [
+                { value: "org-304", displayName: "Site Surveys (MODS)" },
+              ],
+            }),
+          ),
+      });
+    });
+
+    const result = await listTeams(testInstance);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].title, "Site Surveys (MODS)");
+    assert.equal(result[0].id, "org-304");
   });
 });
 
