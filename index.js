@@ -2981,7 +2981,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const teams = await listTeams(tempInst);
           if (teams && teams.length > 0) {
             const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
-            text += `\n\n⚠ No default team configured. Available teams:\n${list}\n0. None\n\nAsk the user which team to set as default. If they pick one, call jira_add_instance with name="${instName}" and defaultTeam="<team name>". If "None" is selected, call jira_add_instance with defaultTeam="none" to stop future prompts.`;
+            text += `\n\n⚠ No default team configured. Available teams:\n${list}\n0. None\n\nAsk the user to pick a number, type a team name to search, or choose None.\nIf they pick one, call jira_add_instance with name="${instName}" and defaultTeam="<team name>".\nIf the team is not listed, the user can type a name and you search with jira_add_instance defaultTeam="<name>" (it validates automatically).\nIf "None" is selected, call jira_add_instance with defaultTeam="none" to stop future prompts.`;
           }
         } catch {
           // Teams API not available, skip
@@ -3093,7 +3093,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const teams = await listTeams(inst);
           if (teams && teams.length > 0) {
             const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
-            teamPrompt = `\n\n⚠ No team assigned and no default team configured for instance "${inst.name}". Available teams:\n${list}\n0. None\n\nTo assign a team to this ticket, call jira_update_ticket with issueKey and team parameter.\nIf a team is selected, ask the user if it should also be saved as the default team for instance "${inst.name}" (via jira_add_instance with defaultTeam). If "None" is selected, call jira_add_instance with defaultTeam="none" to stop future prompts.`;
+            teamPrompt = `\n\n⚠ No team assigned and no default team configured for instance "${inst.name}". Available teams:\n${list}\n0. None\n\nAsk the user to pick a number, type a team name to search, or choose None.\nTo assign, call jira_update_ticket with issueKey and team parameter.\nIf a team is selected, ask the user if it should also be saved as the default team for instance "${inst.name}" (via jira_add_instance with defaultTeam).\nIf the team is not listed, the user can type a name and you search with jira_update_ticket team="<name>" (it validates automatically).\nIf "None" is selected, call jira_add_instance with defaultTeam="none" to stop future prompts.`;
           }
         } catch {
           // Teams API not available, proceed without team
@@ -3514,7 +3514,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const teams = await listTeams(inst);
           if (teams && teams.length > 0) {
             const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
-            teamPrompt = `\n\n⚠ No team assigned (original had none) and no default team configured for instance "${inst.name}". Available teams:\n${list}\n0. None\n\nTo assign a team to this ticket, call jira_update_ticket with issueKey and team parameter.\nIf a team is selected, ask the user if it should also be saved as the default team for instance "${inst.name}" (via jira_add_instance with defaultTeam). If "None" is selected, call jira_add_instance with defaultTeam="none" to stop future prompts.`;
+            teamPrompt = `\n\n⚠ No team assigned (original had none) and no default team configured for instance "${inst.name}". Available teams:\n${list}\n0. None\n\nAsk the user to pick a number, type a team name to search, or choose None.\nTo assign, call jira_update_ticket with issueKey and team parameter.\nIf a team is selected, ask the user if it should also be saved as the default team for instance "${inst.name}" (via jira_add_instance with defaultTeam).\nIf the team is not listed, the user can type a name and you search with jira_update_ticket team="<name>" (it validates automatically).\nIf "None" is selected, call jira_add_instance with defaultTeam="none" to stop future prompts.`;
           }
         } catch {
           // Teams API not available, proceed without team
