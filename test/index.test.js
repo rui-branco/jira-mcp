@@ -55,7 +55,9 @@ require.cache[stdioPath] = {
   exports: { StdioServerTransport: class {} },
 };
 
-const { buildCommentADF, parseInlineFormatting, findJiraTicketKeys, resolveTeamId, fetchJiraTeams, listTeams, searchTeamsViaJql } = require("../index.js");
+const { buildCommentADF, parseInlineFormatting, autoLinkTextNodes, findJiraTicketKeys, resolveTeamId, fetchJiraTeams, listTeams, searchTeamsViaJql } = require("../index.js");
+
+const fakeInstance = { baseUrl: "https://test.atlassian.net" };
 
 // ============ parseInlineFormatting ============
 
@@ -116,6 +118,62 @@ describe("parseInlineFormatting", () => {
       type: "text",
       text: "here",
       marks: [{ type: "link", attrs: { href: "https://example.com" } }],
+    });
+  });
+
+  it("should auto-link bare URLs", async () => {
+    const result = await parseInlineFormatting("see https://example.com now", fakeInstance);
+    assert.equal(result.length, 3);
+    assert.deepStrictEqual(result[0], { type: "text", text: "see " });
+    assert.deepStrictEqual(result[1], {
+      type: "text",
+      text: "https://example.com",
+      marks: [{ type: "link", attrs: { href: "https://example.com" } }],
+    });
+    assert.deepStrictEqual(result[2], { type: "text", text: " now" });
+  });
+
+  it("should strip trailing punctuation from auto-linked URLs", async () => {
+    const result = await parseInlineFormatting("visit https://example.com.", fakeInstance);
+    assert.equal(result.length, 3);
+    assert.deepStrictEqual(result[1], {
+      type: "text",
+      text: "https://example.com",
+      marks: [{ type: "link", attrs: { href: "https://example.com" } }],
+    });
+    assert.deepStrictEqual(result[2], { type: "text", text: "." });
+  });
+
+  it("should auto-link bare Jira ticket keys", async () => {
+    const result = await parseInlineFormatting("from MODS-14941 onward", fakeInstance);
+    assert.equal(result.length, 3);
+    assert.deepStrictEqual(result[1], {
+      type: "text",
+      text: "MODS-14941",
+      marks: [{ type: "link", attrs: { href: "https://test.atlassian.net/browse/MODS-14941" } }],
+    });
+  });
+
+  it("should parse Jira wiki [text|url] markup", async () => {
+    const result = await parseInlineFormatting("see [the docs|https://example.com] here", fakeInstance);
+    assert.equal(result.length, 3);
+    assert.deepStrictEqual(result[1], {
+      type: "text",
+      text: "the docs",
+      marks: [{ type: "link", attrs: { href: "https://example.com" } }],
+    });
+  });
+
+  it("should not double-link URLs that contain a ticket key", async () => {
+    const result = await parseInlineFormatting(
+      "https://test.atlassian.net/browse/MODS-14941",
+      fakeInstance,
+    );
+    assert.equal(result.length, 1);
+    assert.deepStrictEqual(result[0], {
+      type: "text",
+      text: "https://test.atlassian.net/browse/MODS-14941",
+      marks: [{ type: "link", attrs: { href: "https://test.atlassian.net/browse/MODS-14941" } }],
     });
   });
 

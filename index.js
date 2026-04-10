@@ -459,7 +459,73 @@ async function parseInlineFormatting(text, instance = defaultInstance) {
     nodes.push({ type: "text", text: text.substring(lastIndex) });
   }
 
-  return nodes.length > 0 ? nodes : [{ type: "text", text: text }];
+  const finalNodes = nodes.length > 0 ? nodes : [{ type: "text", text }];
+  return autoLinkTextNodes(finalNodes, instance);
+}
+
+// Post-process plain text nodes: convert bare URLs and bare Jira ticket keys
+// (e.g. PROJ-123) into ADF link nodes. Jira does NOT auto-link plain text in
+// ADF — links must be explicit `link` marks.
+function autoLinkTextNodes(nodes, instance = defaultInstance) {
+  const baseUrl = instance && instance.baseUrl;
+  const result = [];
+  // Bare URL OR Jira wiki-style [text|url] OR bare ticket key (PROJ-123)
+  const re = /(\[([^\]|\n]+)\|(https?:\/\/[^\]\s]+)\])|(https?:\/\/[^\s<>()\[\]]+)|(\b[A-Z][A-Z0-9]+-\d+\b)/g;
+  for (const node of nodes) {
+    if (node.type !== "text" || (node.marks && node.marks.length > 0)) {
+      result.push(node);
+      continue;
+    }
+    const text = node.text;
+    let last = 0;
+    let m;
+    re.lastIndex = 0;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > last) {
+        result.push({ type: "text", text: text.substring(last, m.index) });
+      }
+      if (m[1]) {
+        // [label|url] wiki markup
+        result.push({
+          type: "text",
+          text: m[2],
+          marks: [{ type: "link", attrs: { href: m[3] } }],
+        });
+      } else if (m[4]) {
+        // Bare URL — strip trailing punctuation that's unlikely to be part of the URL
+        let url = m[4];
+        const trailingMatch = url.match(/[.,;:!?]+$/);
+        let consumed = m[0].length;
+        if (trailingMatch) {
+          url = url.substring(0, url.length - trailingMatch[0].length);
+          consumed -= trailingMatch[0].length;
+        }
+        result.push({
+          type: "text",
+          text: url,
+          marks: [{ type: "link", attrs: { href: url } }],
+        });
+        last = m.index + consumed;
+        re.lastIndex = last;
+        continue;
+      } else if (m[5] && baseUrl) {
+        // Bare ticket key
+        const key = m[5];
+        result.push({
+          type: "text",
+          text: key,
+          marks: [{ type: "link", attrs: { href: `${baseUrl}/browse/${key}` } }],
+        });
+      } else if (m[5]) {
+        result.push({ type: "text", text: m[5] });
+      }
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) {
+      result.push({ type: "text", text: text.substring(last) });
+    }
+  }
+  return result;
 }
 
 // Parse text with markdown formatting and @mentions, build ADF content
@@ -3831,5 +3897,5 @@ if (require.main === module) {
 
 // Export for testing
 if (typeof module !== "undefined") {
-  module.exports = { buildCommentADF, parseInlineFormatting, findJiraTicketKeys, resolveTeamId, fetchJiraTeams, listTeams, searchTeamsViaJql };
+  module.exports = { buildCommentADF, parseInlineFormatting, autoLinkTextNodes, findJiraTicketKeys, resolveTeamId, fetchJiraTeams, listTeams, searchTeamsViaJql };
 }
