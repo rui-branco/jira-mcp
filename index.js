@@ -2505,24 +2505,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       const content = [{ type: "text", text: result.text }];
 
-      // Add Jira images. Anthropic vision only accepts png/jpeg/gif/webp;
-      // SVG and other formats must be skipped or the API rejects the whole
-      // response with "Improperly formed request". Also skip files over 5MB.
-      const mimeByExt = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-      };
+      // Anthropic vision only accepts png/jpeg/gif/webp under 5MB. We sniff
+      // the magic bytes instead of trusting the filename, since a misnamed
+      // file (e.g. SVG saved as .png) gets the whole response rejected with
+      // "Could not process image".
       const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+      const detectImageMime = (buf) => {
+        if (!buf || buf.length < 12) return null;
+        if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
+        if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+        if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return "image/gif";
+        if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+            buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return "image/webp";
+        return null;
+      };
       for (const imagePath of result.jiraImages) {
         try {
-          const ext = path.extname(imagePath).toLowerCase();
-          const mimeType = mimeByExt[ext];
-          if (!mimeType) continue;
           const imageData = fs.readFileSync(imagePath);
           if (imageData.length > MAX_IMAGE_BYTES) continue;
+          const mimeType = detectImageMime(imageData);
+          if (!mimeType) continue;
           content.push({
             type: "image",
             data: imageData.toString("base64"),
@@ -2533,17 +2535,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      // Add Figma images (now supports multiple images per design)
+      // Figma images (multiple per design). Validate magic bytes here too.
       for (const design of result.figmaDesigns) {
         if (design.images && design.images.length > 0) {
           for (const img of design.images) {
-            if (img.buffer && img.buffer.length <= MAX_IMAGE_BYTES) {
-              content.push({
-                type: "image",
-                data: img.buffer.toString("base64"),
-                mimeType: "image/png",
-              });
-            }
+            if (!img.buffer || img.buffer.length > MAX_IMAGE_BYTES) continue;
+            const mimeType = detectImageMime(img.buffer);
+            if (!mimeType) continue;
+            content.push({
+              type: "image",
+              data: img.buffer.toString("base64"),
+              mimeType: mimeType,
+            });
           }
         }
       }
