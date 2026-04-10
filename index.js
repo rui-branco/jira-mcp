@@ -2505,19 +2505,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       const content = [{ type: "text", text: result.text }];
 
-      // Add Jira images
+      // Add Jira images. Anthropic vision only accepts png/jpeg/gif/webp;
+      // SVG and other formats must be skipped or the API rejects the whole
+      // response with "Improperly formed request". Also skip files over 5MB.
+      const mimeByExt = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+      };
+      const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
       for (const imagePath of result.jiraImages) {
         try {
-          const imageData = fs.readFileSync(imagePath);
           const ext = path.extname(imagePath).toLowerCase();
-          const mimeType =
-            ext === ".png"
-              ? "image/png"
-              : ext === ".gif"
-                ? "image/gif"
-                : ext === ".webp"
-                  ? "image/webp"
-                  : "image/jpeg";
+          const mimeType = mimeByExt[ext];
+          if (!mimeType) continue;
+          const imageData = fs.readFileSync(imagePath);
+          if (imageData.length > MAX_IMAGE_BYTES) continue;
           content.push({
             type: "image",
             data: imageData.toString("base64"),
@@ -2532,7 +2537,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       for (const design of result.figmaDesigns) {
         if (design.images && design.images.length > 0) {
           for (const img of design.images) {
-            if (img.buffer) {
+            if (img.buffer && img.buffer.length <= MAX_IMAGE_BYTES) {
               content.push({
                 type: "image",
                 data: img.buffer.toString("base64"),
