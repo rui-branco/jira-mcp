@@ -289,6 +289,120 @@ async function downloadAttachment(url, filename, issueKey, instance) {
   return localPath;
 }
 
+// ============ CONFLUENCE FUNCTIONS ============
+
+const confluenceAttachmentDir = path.join(
+  process.env.HOME,
+  ".config/jira-mcp/confluence-attachments",
+);
+if (!fs.existsSync(confluenceAttachmentDir)) {
+  fs.mkdirSync(confluenceAttachmentDir, { recursive: true });
+}
+
+function getConfluenceBaseUrl(instance) {
+  // Confluence Cloud lives at <jiraBaseUrl>/wiki. For Server/DC users can
+  // still override by setting confluenceBaseUrl explicitly in their config.
+  return instance.confluenceBaseUrl || `${instance.baseUrl}/wiki`;
+}
+
+async function fetchConfluence(endpoint, options = {}, instance = defaultInstance) {
+  const { method = "GET", body, rawBody, contentType, extraHeaders } = options;
+  const headers = {
+    Authorization: `Basic ${instance.auth}`,
+    Accept: "application/json",
+  };
+  if (rawBody !== undefined) {
+    if (contentType) headers["Content-Type"] = contentType;
+  } else if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+  if (extraHeaders) Object.assign(headers, extraHeaders);
+
+  const url = `${getConfluenceBaseUrl(instance)}${endpoint}`;
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: rawBody !== undefined ? rawBody : body ? JSON.stringify(body) : undefined,
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    let detail = "";
+    if (text) {
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed.message) detail = parsed.message;
+        else if (Array.isArray(parsed.errorMessages) && parsed.errorMessages[0]) detail = parsed.errorMessages[0];
+        else if (parsed.data && parsed.data.errors && parsed.data.errors[0]) detail = parsed.data.errors[0].message || JSON.stringify(parsed.data.errors[0]);
+        else detail = text;
+      } catch {
+        detail = text;
+      }
+    }
+    throw new Error(
+      `Confluence API error: ${response.status} ${response.statusText}${detail ? ` - ${detail}` : ""}`,
+    );
+  }
+  return text ? JSON.parse(text) : {};
+}
+
+function htmlEscape(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function textToConfluenceStorage(text) {
+  // Split on blank lines, wrap each paragraph in <p>, single newlines become <br/>, escape &<>.
+  const paragraphs = String(text).split(/\n\s*\n/);
+  return paragraphs
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
+    .map((p) => `<p>${htmlEscape(p).replace(/\n/g, "<br/>")}</p>`)
+    .join("");
+}
+
+async function downloadConfluenceAttachment(pageId, filename, instance) {
+  const pageDir = path.join(confluenceAttachmentDir, pageId);
+  if (!fs.existsSync(pageDir)) fs.mkdirSync(pageDir, { recursive: true });
+  const localPath = path.join(pageDir, filename);
+  if (fs.existsSync(localPath)) return localPath;
+
+  // Find the attachment by filename
+  const list = await fetchConfluence(
+    `/rest/api/content/${encodeURIComponent(pageId)}/child/attachment?limit=200&filename=${encodeURIComponent(filename)}`,
+    {},
+    instance,
+  );
+  let att = (list.results || []).find((a) => a.title === filename);
+  if (!att) {
+    // Fallback: list everything and match
+    const all = await fetchConfluence(
+      `/rest/api/content/${encodeURIComponent(pageId)}/child/attachment?limit=200`,
+      {},
+      instance,
+    );
+    att = (all.results || []).find((a) => a.title === filename);
+  }
+  if (!att) {
+    throw new Error(`Attachment "${filename}" not found on page ${pageId}.`);
+  }
+  const downloadPath = att._links && att._links.download;
+  const url = downloadPath
+    ? `${getConfluenceBaseUrl(instance)}${downloadPath}`
+    : `${getConfluenceBaseUrl(instance)}/rest/api/content/${encodeURIComponent(att.id)}/data`;
+
+  const response = await fetch(url, {
+    headers: { Authorization: `Basic ${instance.auth}` },
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to download ${filename}: ${response.status}`);
+  }
+  const buffer = await response.buffer();
+  fs.writeFileSync(localPath, buffer);
+  return localPath;
+}
+
 function extractText(content, urls = []) {
   if (!content) return { text: "", urls };
   if (typeof content === "string") return { text: content, urls };
@@ -2511,6 +2625,305 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["projectKey"],
         },
       },
+      {
+        name: "confluence_get_spaces",
+        description:
+          "List Confluence global spaces. Returns [{ key, name, id }]. On Cloud reuses the Jira instance credentials (Confluence base URL is <jiraBaseUrl>/wiki).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            instance: {
+              type: "string",
+              description: "Instance name. Uses default instance if omitted.",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "confluence_get_space",
+        description:
+          "Get a single Confluence space by key. Returns space metadata including description and homepage.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            spaceKey: { type: "string", description: "Space key (e.g., 'ENG')." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["spaceKey"],
+        },
+      },
+      {
+        name: "confluence_create_space",
+        description:
+          "Create a new Confluence global space. Provide key, name, and optional description (plain text).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            spaceKey: { type: "string", description: "Unique space key (letters/numbers). Will be uppercased." },
+            name: { type: "string", description: "Human-readable space name." },
+            description: { type: "string", description: "Optional plain-text description." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["spaceKey", "name"],
+        },
+      },
+      {
+        name: "confluence_update_space",
+        description:
+          "Update a Confluence space's name or description. At least one of name/description must be provided.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            spaceKey: { type: "string", description: "Space key to update." },
+            name: { type: "string", description: "New space name." },
+            description: { type: "string", description: "New plain-text description." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["spaceKey"],
+        },
+      },
+      {
+        name: "confluence_delete_space",
+        description:
+          "Delete a Confluence space by key. This is asynchronous on Confluence Cloud — the call returns a long-running task.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            spaceKey: { type: "string", description: "Space key to delete." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["spaceKey"],
+        },
+      },
+      {
+        name: "confluence_search",
+        description:
+          "Confluence CQL search for content. Builds CQL: text ~ \"<query>\" AND type = <type> [AND space = \"<key>\"] ORDER BY lastModified DESC.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Free-text search term." },
+            spaceKey: { type: "string", description: "Optional space key to scope the search." },
+            type: { type: "string", description: "Content type (default: page). e.g. page, blogpost, comment, attachment." },
+            limit: { type: "number", description: "Max results (default: 25)." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "confluence_get_recent_pages",
+        description:
+          "List recently modified pages within a time window. Params: spaceKey (optional), sinceDays (default 30), limit (default 25).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            spaceKey: { type: "string", description: "Optional space key to scope the query." },
+            sinceDays: { type: "number", description: "Days back from now (default: 30)." },
+            limit: { type: "number", description: "Max results (default: 25)." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "confluence_get_space_root_pages",
+        description:
+          "List top-level (root) pages in a Confluence space, expanded with childTypes.page so consumers can tell which pages have children.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            spaceKey: { type: "string", description: "Space key (required)." },
+            limit: { type: "number", description: "Max results (default: 50)." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["spaceKey"],
+        },
+      },
+      {
+        name: "confluence_get_page_children",
+        description:
+          "List direct child pages of a Confluence page, expanded with version, history and childTypes.page.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pageId: { type: "string", description: "Parent page ID (required)." },
+            limit: { type: "number", description: "Max results (default: 50)." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["pageId"],
+        },
+      },
+      {
+        name: "confluence_get_page",
+        description:
+          "Fetch a full Confluence page. Returns v1 content (body.view, body.storage, space, ancestors, labels) merged with v2 body.atlas_doc_format when includeAdf is true. ADF is the only format that preserves table cell background colors on modern Cloud pages.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pageId: { type: "string", description: "Page ID (required)." },
+            includeAdf: { type: "boolean", description: "Fetch ADF body via v2 API and merge (default: true)." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["pageId"],
+        },
+      },
+      {
+        name: "confluence_get_comments",
+        description:
+          "List comments on a Confluence page, expanded with body.view, version, created/updated history.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pageId: { type: "string", description: "Page ID (required)." },
+            limit: { type: "number", description: "Max results (default: 50)." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["pageId"],
+        },
+      },
+      {
+        name: "confluence_add_comment",
+        description:
+          "Add a footer comment to a Confluence page. Default format is 'text' (plain text / markdown-lite is wrapped in <p>…</p> with <br/> for single newlines). Use format='storage' to pass valid storage XHTML as-is.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pageId: { type: "string", description: "Page ID (required)." },
+            body: { type: "string", description: "Comment body (plain text by default, or storage XHTML if format=storage)." },
+            format: { type: "string", description: "'text' (default) or 'storage'." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["pageId", "body"],
+        },
+      },
+      {
+        name: "confluence_update_page",
+        description:
+          "Update an existing Confluence page. Title and/or body (storage XHTML). Version auto-bumps if omitted (fetches current version first). Confluence requires version.number = current + 1.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pageId: { type: "string", description: "Page ID (required)." },
+            title: { type: "string", description: "New page title (optional — retains current if omitted)." },
+            body: { type: "string", description: "New body as storage XHTML (optional — retains current if omitted)." },
+            version: { type: "number", description: "Explicit new version number. If omitted, current+1 is computed." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["pageId"],
+        },
+      },
+      {
+        name: "confluence_create_page",
+        description:
+          "Create a new Confluence page. Body must be storage XHTML. Optional parentId nests under an existing page.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            spaceKey: { type: "string", description: "Target space key (required)." },
+            title: { type: "string", description: "Page title (required)." },
+            body: { type: "string", description: "Storage-format XHTML body (required)." },
+            parentId: { type: "string", description: "Optional parent page ID to nest under." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["spaceKey", "title", "body"],
+        },
+      },
+      {
+        name: "confluence_delete_page",
+        description: "Delete a Confluence page by ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pageId: { type: "string", description: "Page ID (required)." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["pageId"],
+        },
+      },
+      {
+        name: "confluence_get_labels",
+        description: "List labels on a Confluence page.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pageId: { type: "string", description: "Page ID (required)." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["pageId"],
+        },
+      },
+      {
+        name: "confluence_add_label",
+        description: "Add a label to a Confluence page.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pageId: { type: "string", description: "Page ID (required)." },
+            label: { type: "string", description: "Label name (required)." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["pageId", "label"],
+        },
+      },
+      {
+        name: "confluence_remove_label",
+        description: "Remove a label from a Confluence page.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pageId: { type: "string", description: "Page ID (required)." },
+            label: { type: "string", description: "Label name (required)." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["pageId", "label"],
+        },
+      },
+      {
+        name: "confluence_list_attachments",
+        description: "List attachments on a Confluence page.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pageId: { type: "string", description: "Page ID (required)." },
+            limit: { type: "number", description: "Max results (default: 50)." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["pageId"],
+        },
+      },
+      {
+        name: "confluence_upload_attachment",
+        description:
+          "Upload a file as an attachment to a Confluence page. Provide either filePath or fileContent (base64) + fileName.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pageId: { type: "string", description: "Page ID (required)." },
+            filePath: { type: "string", description: "Absolute path to the local file to upload." },
+            fileContent: { type: "string", description: "Base64-encoded file content (requires fileName)." },
+            fileName: { type: "string", description: "File name (required with fileContent; optional with filePath)." },
+            comment: { type: "string", description: "Optional attachment comment." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["pageId"],
+        },
+      },
+      {
+        name: "confluence_download_attachment",
+        description:
+          "Download an attachment from a Confluence page by filename. Saves under ~/.config/jira-mcp/confluence-attachments/<pageId>/ and returns the local path.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pageId: { type: "string", description: "Page ID (required)." },
+            filename: { type: "string", description: "Attachment filename (required)." },
+            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+          },
+          required: ["pageId", "filename"],
+        },
+      },
     ],
   };
 });
@@ -3875,6 +4288,483 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       return { content: [{ type: "text", text }] };
 
+    } else if (name === "confluence_get_spaces") {
+      const inst = getInstanceByName(args.instance);
+      const result = await fetchConfluence(
+        "/rest/api/space?type=global&limit=100",
+        {},
+        inst,
+      );
+      const spaces = (result.results || []).map((s) => ({
+        key: s.key,
+        name: s.name,
+        id: s.id,
+      }));
+      if (spaces.length === 0) {
+        return { content: [{ type: "text", text: "No Confluence spaces found." }] };
+      }
+      let text = `# Confluence Spaces (${spaces.length})\n\n`;
+      for (const s of spaces) {
+        text += `- **${s.name}** (key: ${s.key}, id: ${s.id})\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "confluence_get_space") {
+      const inst = getInstanceByName(args.instance);
+      const result = await fetchConfluence(
+        `/rest/api/space/${encodeURIComponent(args.spaceKey)}?expand=description.plain,homepage`,
+        {},
+        inst,
+      );
+      const desc = result.description?.plain?.value || "";
+      let text = `# Space ${result.name} (${result.key})\n\n`;
+      text += `- **ID:** ${result.id}\n`;
+      text += `- **Type:** ${result.type}\n`;
+      if (result.homepage?.id) text += `- **Homepage:** ${result.homepage.title} (id: ${result.homepage.id})\n`;
+      if (desc) text += `\n${desc}\n`;
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "confluence_create_space") {
+      const inst = getInstanceByName(args.instance);
+      const body = {
+        key: args.spaceKey.toUpperCase(),
+        name: args.name,
+      };
+      if (args.description) {
+        body.description = {
+          plain: { value: args.description, representation: "plain" },
+        };
+      }
+      const result = await fetchConfluence("/rest/api/space", { method: "POST", body }, inst);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Created space **${result.name}** (key: ${result.key}, id: ${result.id}).`,
+          },
+        ],
+      };
+
+    } else if (name === "confluence_update_space") {
+      const inst = getInstanceByName(args.instance);
+      if (!args.name && args.description === undefined) {
+        return {
+          content: [{ type: "text", text: "Provide at least one of name or description." }],
+          isError: true,
+        };
+      }
+      const body = {};
+      if (args.name) body.name = args.name;
+      if (args.description !== undefined) {
+        body.description = {
+          plain: { value: args.description, representation: "plain" },
+        };
+      }
+      const result = await fetchConfluence(
+        `/rest/api/space/${encodeURIComponent(args.spaceKey)}`,
+        { method: "PUT", body },
+        inst,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Updated space **${result.name || args.spaceKey}** (key: ${result.key || args.spaceKey}).`,
+          },
+        ],
+      };
+
+    } else if (name === "confluence_delete_space") {
+      const inst = getInstanceByName(args.instance);
+      const result = await fetchConfluence(
+        `/rest/api/space/${encodeURIComponent(args.spaceKey)}`,
+        { method: "DELETE" },
+        inst,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Delete requested for space ${args.spaceKey}.${result.id ? ` Long-running task id: ${result.id}.` : ""}`,
+          },
+        ],
+      };
+
+    } else if (name === "confluence_search") {
+      const inst = getInstanceByName(args.instance);
+      const type = args.type || "page";
+      const limit = args.limit || 25;
+      const safeQuery = String(args.query).replace(/"/g, '\\"');
+      let cql = `text ~ "${safeQuery}" AND type = ${type}`;
+      if (args.spaceKey) cql += ` AND space = "${args.spaceKey}"`;
+      cql += ` ORDER BY lastModified DESC`;
+      const result = await fetchConfluence(
+        `/rest/api/content/search?cql=${encodeURIComponent(cql)}&limit=${limit}&expand=content.version,content.space,content.history.lastUpdated`,
+        {},
+        inst,
+      );
+      const rows = result.results || [];
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: `No Confluence results for "${args.query}".` }] };
+      }
+      let text = `# Confluence search (${rows.length})\n\n`;
+      for (const r of rows) {
+        const spaceKey = r.space?.key || r.resultGlobalContainer?.displayUrl || "?";
+        const updated = r.history?.lastUpdated?.when || r.version?.when || "";
+        text += `- **${r.title}** (id: ${r.id}, type: ${r.type}, space: ${spaceKey})${updated ? ` — updated ${updated}` : ""}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "confluence_get_recent_pages") {
+      const inst = getInstanceByName(args.instance);
+      const sinceDays = args.sinceDays || 30;
+      const limit = args.limit || 25;
+      let cql = `type = page`;
+      if (args.spaceKey) cql += ` AND space = "${args.spaceKey}"`;
+      cql += ` AND lastModified >= now("-${sinceDays}d") ORDER BY lastModified DESC`;
+      const result = await fetchConfluence(
+        `/rest/api/content/search?cql=${encodeURIComponent(cql)}&limit=${limit}&expand=content.version,content.space,content.history.lastUpdated`,
+        {},
+        inst,
+      );
+      const rows = result.results || [];
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: `No pages modified in the last ${sinceDays} days.` }] };
+      }
+      let text = `# Recently modified pages (${rows.length}, last ${sinceDays}d)\n\n`;
+      for (const r of rows) {
+        const spaceKey = r.space?.key || "?";
+        const updated = r.history?.lastUpdated?.when || "";
+        const by = r.history?.lastUpdated?.by?.displayName || "";
+        text += `- **${r.title}** (id: ${r.id}, space: ${spaceKey})${updated ? ` — ${updated}` : ""}${by ? ` by ${by}` : ""}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "confluence_get_space_root_pages") {
+      const inst = getInstanceByName(args.instance);
+      const limit = args.limit || 50;
+      const result = await fetchConfluence(
+        `/rest/api/content?type=page&spaceKey=${encodeURIComponent(args.spaceKey)}&depth=root&limit=${limit}&expand=version,history.lastUpdated,childTypes.page`,
+        {},
+        inst,
+      );
+      const rows = result.results || [];
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: `No root pages in space ${args.spaceKey}.` }] };
+      }
+      let text = `# Root pages in ${args.spaceKey} (${rows.length})\n\n`;
+      for (const r of rows) {
+        const hasChildren = r.childTypes?.page?.value ? " [has children]" : "";
+        const updated = r.history?.lastUpdated?.when || "";
+        text += `- **${r.title}** (id: ${r.id}, v${r.version?.number || "?"})${hasChildren}${updated ? ` — ${updated}` : ""}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "confluence_get_page_children") {
+      const inst = getInstanceByName(args.instance);
+      const limit = args.limit || 50;
+      const result = await fetchConfluence(
+        `/rest/api/content/${encodeURIComponent(args.pageId)}/child/page?limit=${limit}&expand=version,history.lastUpdated,childTypes.page`,
+        {},
+        inst,
+      );
+      const rows = result.results || [];
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: `No child pages for ${args.pageId}.` }] };
+      }
+      let text = `# Children of page ${args.pageId} (${rows.length})\n\n`;
+      for (const r of rows) {
+        const hasChildren = r.childTypes?.page?.value ? " [has children]" : "";
+        const updated = r.history?.lastUpdated?.when || "";
+        text += `- **${r.title}** (id: ${r.id}, v${r.version?.number || "?"})${hasChildren}${updated ? ` — ${updated}` : ""}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "confluence_get_page") {
+      const inst = getInstanceByName(args.instance);
+      const includeAdf = args.includeAdf !== false;
+      const v1Path = `/rest/api/content/${encodeURIComponent(args.pageId)}?expand=body.view,body.storage,version,space,ancestors,history.lastUpdated,metadata.labels`;
+      const v2Path = `/api/v2/pages/${encodeURIComponent(args.pageId)}?body-format=atlas_doc_format`;
+      const [v1, v2] = await Promise.all([
+        fetchConfluence(v1Path, {}, inst),
+        includeAdf
+          ? fetchConfluence(v2Path, {}, inst).catch((e) => ({ __adfError: e.message }))
+          : Promise.resolve(null),
+      ]);
+      if (v2 && v2.body && v2.body.atlas_doc_format) {
+        v1.body = v1.body || {};
+        v1.body.atlas_doc_format = v2.body.atlas_doc_format;
+      }
+      const space = v1.space?.key || "?";
+      const version = v1.version?.number || "?";
+      const updatedBy = v1.history?.lastUpdated?.by?.displayName || "";
+      const updatedAt = v1.history?.lastUpdated?.when || "";
+      const labels = (v1.metadata?.labels?.results || []).map((l) => l.name).join(", ");
+      const viewHtml = v1.body?.view?.value || "";
+      let text = `# ${v1.title} (id: ${v1.id}, space: ${space}, v${version})\n\n`;
+      if (updatedAt) text += `_Last updated ${updatedAt}${updatedBy ? ` by ${updatedBy}` : ""}_\n\n`;
+      if (labels) text += `**Labels:** ${labels}\n\n`;
+      if (viewHtml) {
+        const stripped = viewHtml
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+        text += `${stripped.substring(0, 4000)}${stripped.length > 4000 ? "…" : ""}\n\n`;
+      }
+      if (includeAdf && v2 && v2.__adfError) {
+        text += `\n_ADF fetch failed: ${v2.__adfError}_\n`;
+      } else if (includeAdf && v1.body?.atlas_doc_format) {
+        text += `_ADF body included (body.atlas_doc_format)._\n`;
+      }
+      text += `\n---\nFull page JSON:\n\`\`\`json\n${JSON.stringify(v1, null, 2).substring(0, 30000)}\n\`\`\``;
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "confluence_get_comments") {
+      const inst = getInstanceByName(args.instance);
+      const limit = args.limit || 50;
+      const result = await fetchConfluence(
+        `/rest/api/content/${encodeURIComponent(args.pageId)}/child/comment?limit=${limit}&depth=all&expand=body.view,version,history.createdBy,history.lastUpdated`,
+        {},
+        inst,
+      );
+      const rows = result.results || [];
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: `No comments on page ${args.pageId}.` }] };
+      }
+      let text = `# Comments on page ${args.pageId} (${rows.length})\n\n`;
+      for (const c of rows) {
+        const author = c.history?.createdBy?.displayName || "Unknown";
+        const when = c.history?.createdDate || c.version?.when || "";
+        const bodyHtml = c.body?.view?.value || "";
+        const stripped = bodyHtml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+        text += `- **${author}** (id: ${c.id})${when ? ` — ${when}` : ""}\n  ${stripped.substring(0, 500)}${stripped.length > 500 ? "…" : ""}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "confluence_add_comment") {
+      const inst = getInstanceByName(args.instance);
+      const format = args.format || "text";
+      const value = format === "storage" ? args.body : textToConfluenceStorage(args.body);
+      const body = {
+        type: "comment",
+        container: { id: args.pageId, type: "page" },
+        body: { storage: { value, representation: "storage" } },
+      };
+      const result = await fetchConfluence("/rest/api/content", { method: "POST", body }, inst);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Comment added to page ${args.pageId} (comment id: ${result.id}).`,
+          },
+        ],
+      };
+
+    } else if (name === "confluence_update_page") {
+      const inst = getInstanceByName(args.instance);
+      if (!args.title && args.body === undefined && !args.version) {
+        return {
+          content: [{ type: "text", text: "Provide at least one of title or body to update." }],
+          isError: true,
+        };
+      }
+      // Fetch current state so we can fill in anything the caller omitted.
+      const current = await fetchConfluence(
+        `/rest/api/content/${encodeURIComponent(args.pageId)}?expand=version,space,body.storage`,
+        {},
+        inst,
+      );
+      const versionNumber = args.version || (current.version?.number || 0) + 1;
+      const title = args.title || current.title;
+      const value = args.body !== undefined ? args.body : current.body?.storage?.value || "";
+      const spaceKey = current.space?.key;
+      const body = {
+        id: args.pageId,
+        type: "page",
+        title,
+        space: spaceKey ? { key: spaceKey } : undefined,
+        body: { storage: { value, representation: "storage" } },
+        version: { number: versionNumber },
+      };
+      const result = await fetchConfluence(
+        `/rest/api/content/${encodeURIComponent(args.pageId)}`,
+        { method: "PUT", body },
+        inst,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Updated page **${result.title}** (id: ${result.id}, v${result.version?.number}).`,
+          },
+        ],
+      };
+
+    } else if (name === "confluence_create_page") {
+      const inst = getInstanceByName(args.instance);
+      const body = {
+        type: "page",
+        title: args.title,
+        space: { key: args.spaceKey },
+        body: { storage: { value: args.body, representation: "storage" } },
+      };
+      if (args.parentId) body.ancestors = [{ id: args.parentId }];
+      const result = await fetchConfluence("/rest/api/content", { method: "POST", body }, inst);
+      const webui = result._links?.webui
+        ? `${getConfluenceBaseUrl(inst)}${result._links.webui}`
+        : "";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Created page **${result.title}** (id: ${result.id}, space: ${args.spaceKey}).${webui ? `\nURL: ${webui}` : ""}`,
+          },
+        ],
+      };
+
+    } else if (name === "confluence_delete_page") {
+      const inst = getInstanceByName(args.instance);
+      await fetchConfluence(
+        `/rest/api/content/${encodeURIComponent(args.pageId)}`,
+        { method: "DELETE" },
+        inst,
+      );
+      return { content: [{ type: "text", text: `Deleted page ${args.pageId}.` }] };
+
+    } else if (name === "confluence_get_labels") {
+      const inst = getInstanceByName(args.instance);
+      const result = await fetchConfluence(
+        `/rest/api/content/${encodeURIComponent(args.pageId)}/label`,
+        {},
+        inst,
+      );
+      const labels = (result.results || []).map((l) => l.name);
+      if (labels.length === 0) {
+        return { content: [{ type: "text", text: `No labels on page ${args.pageId}.` }] };
+      }
+      return { content: [{ type: "text", text: `Labels on ${args.pageId}: ${labels.join(", ")}` }] };
+
+    } else if (name === "confluence_add_label") {
+      const inst = getInstanceByName(args.instance);
+      await fetchConfluence(
+        `/rest/api/content/${encodeURIComponent(args.pageId)}/label`,
+        { method: "POST", body: [{ prefix: "global", name: args.label }] },
+        inst,
+      );
+      return {
+        content: [{ type: "text", text: `Added label "${args.label}" to page ${args.pageId}.` }],
+      };
+
+    } else if (name === "confluence_remove_label") {
+      const inst = getInstanceByName(args.instance);
+      await fetchConfluence(
+        `/rest/api/content/${encodeURIComponent(args.pageId)}/label?name=${encodeURIComponent(args.label)}`,
+        { method: "DELETE" },
+        inst,
+      );
+      return {
+        content: [{ type: "text", text: `Removed label "${args.label}" from page ${args.pageId}.` }],
+      };
+
+    } else if (name === "confluence_list_attachments") {
+      const inst = getInstanceByName(args.instance);
+      const limit = args.limit || 50;
+      const result = await fetchConfluence(
+        `/rest/api/content/${encodeURIComponent(args.pageId)}/child/attachment?limit=${limit}&expand=version,metadata`,
+        {},
+        inst,
+      );
+      const rows = result.results || [];
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: `No attachments on page ${args.pageId}.` }] };
+      }
+      let text = `# Attachments on page ${args.pageId} (${rows.length})\n\n`;
+      for (const a of rows) {
+        const size = a.extensions?.fileSize ? ` ${a.extensions.fileSize}B` : "";
+        const mt = a.extensions?.mediaType || "";
+        text += `- **${a.title}** (id: ${a.id}, v${a.version?.number || "?"})${mt ? ` ${mt}` : ""}${size}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+
+    } else if (name === "confluence_upload_attachment") {
+      const inst = getInstanceByName(args.instance);
+      let fileBuffer;
+      let fileName;
+      if (args.filePath) {
+        if (!fs.existsSync(args.filePath)) {
+          return {
+            content: [{ type: "text", text: `Error: File not found: ${args.filePath}` }],
+            isError: true,
+          };
+        }
+        fileBuffer = fs.readFileSync(args.filePath);
+        fileName = args.fileName || path.basename(args.filePath);
+      } else if (args.fileContent) {
+        if (!args.fileName) {
+          return {
+            content: [{ type: "text", text: "Error: fileName is required when using fileContent." }],
+            isError: true,
+          };
+        }
+        fileBuffer = Buffer.from(args.fileContent, "base64");
+        fileName = args.fileName;
+      } else {
+        return {
+          content: [{ type: "text", text: "Error: Provide either filePath or fileContent." }],
+          isError: true,
+        };
+      }
+
+      const boundary = "----ConfluenceMCPBoundary" + Date.now();
+      const parts = [];
+      parts.push(Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      ));
+      parts.push(fileBuffer);
+      parts.push(Buffer.from(`\r\n`));
+      if (args.comment) {
+        parts.push(Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="comment"\r\n\r\n${args.comment}\r\n`,
+        ));
+      }
+      parts.push(Buffer.from(`--${boundary}--\r\n`));
+      const bodyBuffer = Buffer.concat(parts);
+
+      const url = `${getConfluenceBaseUrl(inst)}/rest/api/content/${encodeURIComponent(args.pageId)}/child/attachment`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${inst.auth}`,
+          "X-Atlassian-Token": "no-check",
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        },
+        body: bodyBuffer,
+      });
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => "");
+        throw new Error(
+          `Confluence API error: ${response.status} ${response.statusText}${errorBody ? ` - ${errorBody}` : ""}`,
+        );
+      }
+      const result = await response.json();
+      const rows = result.results || (Array.isArray(result) ? result : [result]);
+      const names = rows.map((a) => a.title || a.filename).join(", ");
+      return {
+        content: [{ type: "text", text: `Uploaded ${names} to page ${args.pageId}.` }],
+      };
+
+    } else if (name === "confluence_download_attachment") {
+      const inst = getInstanceByName(args.instance);
+      const localPath = await downloadConfluenceAttachment(args.pageId, args.filename, inst);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Downloaded "${args.filename}" from page ${args.pageId} to ${localPath}`,
+          },
+        ],
+      };
+
     } else {
       throw new Error(`Unknown tool: ${name}`);
     }
@@ -3897,5 +4787,5 @@ if (require.main === module) {
 
 // Export for testing
 if (typeof module !== "undefined") {
-  module.exports = { buildCommentADF, parseInlineFormatting, autoLinkTextNodes, findJiraTicketKeys, resolveTeamId, fetchJiraTeams, listTeams, searchTeamsViaJql };
+  module.exports = { buildCommentADF, parseInlineFormatting, autoLinkTextNodes, findJiraTicketKeys, resolveTeamId, fetchJiraTeams, listTeams, searchTeamsViaJql, fetchConfluence, getConfluenceBaseUrl, textToConfluenceStorage, htmlEscape };
 }

@@ -169,6 +169,38 @@ To enable Figma integration:
 | `jira_transition` | Change ticket status by name or ID (auto-handles intermediate steps) | `issueKey` (required), `targetStatus` or `transitionId` |
 | `jira_update_ticket` | Update ticket fields (summary, description, assignee, priority, labels) | `issueKey` (required), plus optional field parameters |
 
+### Confluence Tools
+
+This MCP also exposes Confluence via the same Atlassian credentials. On Atlassian Cloud, the API token you configured for Jira works for Confluence too, and the Confluence base URL is derived as `<jiraBaseUrl>/wiki` — **no extra setup required**. Just use the `confluence_*` tools below against any configured instance.
+
+For Server / Data Center deployments where Confluence lives on a different host, set `confluenceBaseUrl` explicitly on the stored instance in `config.json`.
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `confluence_get_spaces` | List global spaces (`key`, `name`, `id`) | `instance` |
+| `confluence_get_space` | Get a single space with description and homepage | `spaceKey` (required), `instance` |
+| `confluence_create_space` | Create a new global space | `spaceKey` (required), `name` (required), `description`, `instance` |
+| `confluence_update_space` | Update a space's name and/or description | `spaceKey` (required), `name`, `description`, `instance` |
+| `confluence_delete_space` | Delete a space (async on Cloud) | `spaceKey` (required), `instance` |
+| `confluence_search` | CQL text search (`text ~ "<query>" AND type = <type>`) | `query` (required), `spaceKey`, `type`, `limit`, `instance` |
+| `confluence_get_recent_pages` | Pages modified in the last N days | `sinceDays` (default 30), `spaceKey`, `limit`, `instance` |
+| `confluence_get_space_root_pages` | Top-level pages in a space with `childTypes.page` | `spaceKey` (required), `limit`, `instance` |
+| `confluence_get_page_children` | Direct child pages of a page | `pageId` (required), `limit`, `instance` |
+| `confluence_get_page` | Full page with `body.view`, `body.storage` and (by default) v2 `body.atlas_doc_format` merged in | `pageId` (required), `includeAdf`, `instance` |
+| `confluence_get_comments` | List comments on a page | `pageId` (required), `limit`, `instance` |
+| `confluence_add_comment` | Add a footer comment (plain text wrapped into storage XHTML by default) | `pageId` (required), `body` (required), `format` (`text`/`storage`), `instance` |
+| `confluence_update_page` | Update title/body; auto-bumps version if not supplied | `pageId` (required), `title`, `body` (storage XHTML), `version`, `instance` |
+| `confluence_create_page` | Create a page with optional parent | `spaceKey`, `title`, `body` (storage XHTML) (all required), `parentId`, `instance` |
+| `confluence_delete_page` | Delete a page | `pageId` (required), `instance` |
+| `confluence_get_labels` | List labels on a page | `pageId` (required), `instance` |
+| `confluence_add_label` | Add a label to a page | `pageId` (required), `label` (required), `instance` |
+| `confluence_remove_label` | Remove a label from a page | `pageId` (required), `label` (required), `instance` |
+| `confluence_list_attachments` | List attachments on a page | `pageId` (required), `limit`, `instance` |
+| `confluence_upload_attachment` | Upload a file from disk or base64 content | `pageId` (required), `filePath` or `fileContent`+`fileName`, `comment`, `instance` |
+| `confluence_download_attachment` | Download an attachment by filename to the local attachment dir | `pageId` (required), `filename` (required), `instance` |
+
+**Why ADF for `confluence_get_page`?** The v1 `body.atlas_doc_format` expand is unreliable on modern Cloud pages — table cell background colors and some newer node types only survive the v2 `/api/v2/pages/<id>?body-format=atlas_doc_format` endpoint. `confluence_get_page` therefore does both requests in parallel and merges the v2 ADF body onto the v1 response, so callers get `body.view`, `body.storage` and `body.atlas_doc_format` in one shot.
+
 ### Configuration
 
 Config stored at `~/.config/jira-mcp/config.json`:
