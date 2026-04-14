@@ -18,8 +18,12 @@ require.cache[require.resolve("node-fetch")] = {
 };
 
 // Mock the MCP SDK to prevent server startup issues
+// Capture tool handlers so we can invoke them in tests
+const toolHandlers = {};
 const mockServer = {
-  setRequestHandler: () => {},
+  setRequestHandler: (schema, handler) => {
+    toolHandlers[schema] = handler;
+  },
   connect: () => Promise.resolve(),
 };
 const sdkPath = require.resolve("@modelcontextprotocol/sdk/server/index.js");
@@ -732,5 +736,144 @@ describe("fetchJiraTeams", () => {
         return true;
       },
     );
+  });
+});
+
+// ============ jira_create_subtask — team field omission ============
+
+describe("jira_create_subtask", () => {
+  const callToolHandler = toolHandlers["CallToolRequestSchema"];
+
+  beforeEach(() => {
+    fetchMock.mock.resetCalls();
+  });
+
+  it("should NOT include customfield_10001 in the request body", async () => {
+    // fetchJira will be called for POST /issue — capture the body it sends
+    fetchMock.mock.mockImplementation((url, opts) => {
+      return Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ key: "PROJ-124" })),
+      });
+    });
+
+    await callToolHandler({
+      params: {
+        name: "jira_create_subtask",
+        arguments: {
+          parentKey: "PROJ-123",
+          summary: "Test subtask",
+        },
+      },
+    });
+
+    // Find the POST call to /issue (the create call)
+    const createCall = fetchMock.mock.calls.find((c) => {
+      const url = c.arguments[0];
+      const opts = c.arguments[1];
+      return url.includes("/rest/api/3/issue") && opts?.method === "POST";
+    });
+
+    assert.ok(createCall, "Expected a POST /issue call");
+    const body = JSON.parse(createCall.arguments[1].body);
+    assert.equal(
+      body.fields.customfield_10001,
+      undefined,
+      "customfield_10001 must not be present in subtask request — subtasks inherit team from parent",
+    );
+  });
+
+  it("should NOT include customfield_10001 even when team param is omitted and parent has a team", async () => {
+    fetchMock.mock.mockImplementation((url) => {
+      return Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ key: "PROJ-125" })),
+      });
+    });
+
+    await callToolHandler({
+      params: {
+        name: "jira_create_subtask",
+        arguments: {
+          parentKey: "PROJ-123",
+          summary: "Another subtask",
+        },
+      },
+    });
+
+    const createCall = fetchMock.mock.calls.find((c) => {
+      const url = c.arguments[0];
+      const opts = c.arguments[1];
+      return url.includes("/rest/api/3/issue") && opts?.method === "POST";
+    });
+
+    assert.ok(createCall, "Expected a POST /issue call");
+    const body = JSON.parse(createCall.arguments[1].body);
+    assert.ok(
+      !("customfield_10001" in body.fields),
+      "customfield_10001 key must not exist at all in subtask fields",
+    );
+  });
+
+  it("should include standard fields (project, parent, issuetype, summary)", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ key: "PROJ-126" })),
+      }),
+    );
+
+    await callToolHandler({
+      params: {
+        name: "jira_create_subtask",
+        arguments: {
+          parentKey: "PROJ-123",
+          summary: "Subtask with fields",
+          priority: "High",
+          labels: ["backend"],
+        },
+      },
+    });
+
+    const createCall = fetchMock.mock.calls.find((c) => {
+      const url = c.arguments[0];
+      const opts = c.arguments[1];
+      return url.includes("/rest/api/3/issue") && opts?.method === "POST";
+    });
+
+    const body = JSON.parse(createCall.arguments[1].body);
+    assert.deepStrictEqual(body.fields.project, { key: "PROJ" });
+    assert.deepStrictEqual(body.fields.parent, { key: "PROJ-123" });
+    assert.deepStrictEqual(body.fields.issuetype, { name: "Sub-task" });
+    assert.equal(body.fields.summary, "Subtask with fields");
+    assert.deepStrictEqual(body.fields.priority, { name: "High" });
+    assert.deepStrictEqual(body.fields.labels, ["backend"]);
+    assert.ok(!("customfield_10001" in body.fields), "team field must still be absent");
+  });
+
+  it("should not make a fetch call to get parent team", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ key: "PROJ-127" })),
+      }),
+    );
+
+    await callToolHandler({
+      params: {
+        name: "jira_create_subtask",
+        arguments: {
+          parentKey: "PROJ-123",
+          summary: "No parent fetch subtask",
+        },
+      },
+    });
+
+    // Should only have 1 fetch call — the POST /issue create, not a GET for parent team
+    const getCalls = fetchMock.mock.calls.filter((c) => {
+      const opts = c.arguments[1];
+      return !opts?.method || opts.method === "GET";
+    });
+    assert.equal(getCalls.length, 0, "Should not fetch parent issue for team inheritance");
   });
 });
