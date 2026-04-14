@@ -3721,20 +3721,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args.labels) {
         fields.labels = args.labels;
       }
-      let teamWarning = "";
-      if (args.team) {
-        fields.customfield_10001 = await resolveTeamId(args.team, inst);
-      } else {
-        // Inherit team from parent ticket
-        const parentIssue = await fetchJira(
-          `/issue/${args.parentKey}?fields=customfield_10001`, {}, inst,
-        );
-        if (parentIssue.fields?.customfield_10001) {
-          fields.customfield_10001 = parentIssue.fields.customfield_10001;
-        } else if (inst.defaultTeam && inst.defaultTeam !== "none") {
-          teamWarning = `\n\nNote: Parent ${args.parentKey} has no team assigned. Instance default team is "${inst.defaultTeam.name}". Use team parameter to assign it.`;
-        }
-      }
+      // Subtasks inherit team from their parent in Jira — never send customfield_10001
 
       const result = await fetchJira("/issue", { method: "POST", body: { fields } }, inst);
       const newKey = result.key;
@@ -3742,7 +3729,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: `Created subtask ${newKey} under ${args.parentKey}: ${args.summary}\nURL: ${inst.baseUrl}/browse/${newKey}${teamWarning}`,
+            text: `Created subtask ${newKey} under ${args.parentKey}: ${args.summary}\nURL: ${inst.baseUrl}/browse/${newKey}`,
           },
         ],
       };
