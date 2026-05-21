@@ -230,6 +230,87 @@ The server provides clear error messages:
 - Tokens are never logged or transmitted except to Jira/Figma APIs
 - Attachments are downloaded to `~/.config/jira-mcp/attachments/`
 
+## Safety & Observability
+
+Four opt-in controls limit what an agent can do without your approval and give you a trail when something goes wrong. All four are off by default for existing installs — drop the relevant config block into `~/.config/jira-mcp/config.json` to turn them on.
+
+### Per-tool scopes
+
+Restrict which tools each instance can call. Useful for "this Atlassian instance is read-only" or "this one only allows comments".
+
+```json
+{
+  "instances": [
+    {
+      "name": "prod",
+      "email": "you@company.com",
+      "token": "...",
+      "baseUrl": "https://company.atlassian.net",
+      "scopes": { "preset": "read-only" }
+    },
+    {
+      "name": "sandbox",
+      "email": "you@company.com",
+      "token": "...",
+      "baseUrl": "https://sandbox.atlassian.net",
+      "scopes": { "preset": "no-destructive", "deny": ["jira_remove_attachment"] }
+    }
+  ]
+}
+```
+
+Presets: `read-only`, `comments-only`, `no-destructive`, `unrestricted`. You can combine a preset with `allow: [...]` and `deny: [...]` — deny wins. If `scopes` is present, an unknown tool name fails closed. If `scopes` is omitted, the instance behaves as before (no restrictions).
+
+### Dry-run mode
+
+For any mutating tool call, return the HTTP request that *would* be sent without actually calling Atlassian. Useful for previewing what an agent is about to do.
+
+Three layers of precedence (most-specific wins):
+
+1. **Per call:** pass `dryRun: true` to any mutating tool.
+2. **Per instance:** add `"dryRun": true` to an instance in `config.json`.
+3. **Environment:** export `JIRA_MCP_DRY_RUN=1` before launching Claude Code.
+
+Read tools ignore the flag. The response looks like:
+
+```json
+{
+  "dryRun": true,
+  "plan": [{ "api": "jira", "method": "POST", "endpoint": "/issue/PROJ-1/comment", "body": { ... } }]
+}
+```
+
+For multi-step tools (e.g. `jira_transition` with intermediate statuses) only the first write is captured.
+
+### Audit log
+
+Every write attempt — successful, failed, denied by scope, denied by rate limit, or dry-run — is appended as a JSON line to `~/.config/jira-mcp/audit.log`. Token-like fields (`token`, `authorization`, `password`, `apiKey`, `fileContent`, etc.) are redacted before they hit disk. Rotates at 10 MB, keeps 5 historical files.
+
+Disable with `"audit": { "enabled": false }` at the top level of `config.json`.
+
+### Rate limiting
+
+Layered in-memory token buckets prevent runaway loops. Defaults:
+
+- **global:** 60 writes/minute
+- **per-instance:** 30 writes/minute
+- **destructive tools** (`*_delete_*`, `jira_remove_*`, `confluence_delete_*`): 5/minute
+
+On limit hit the tool call fails immediately with a `Rate limit exceeded` error — no sleeping, no queueing. Reads bypass the limiter entirely. Dry-runs don't consume tokens.
+
+Override or disable in `config.json`:
+
+```json
+{
+  "rateLimit": {
+    "enabled": true,
+    "global": 120,
+    "perInstance": 60,
+    "destructive": 10
+  }
+}
+```
+
 ## License
 
 MIT

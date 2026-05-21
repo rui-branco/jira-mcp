@@ -134,10 +134,321 @@ if (!fs.existsSync(attachmentDir)) {
   fs.mkdirSync(attachmentDir, { recursive: true });
 }
 
+// ============ TOOL METADATA + POLICY ============
+//
+// TOOL_METADATA is the source of truth for op classification — NOT the HTTP
+// method. The new Jira /search/jql endpoint is POST but semantically a read,
+// so deciding "is this a write?" from the request method would wrongly trip
+// audit + rate-limit on every search.
+
+const TOOL_METADATA = {
+  // ---- Jira reads ----
+  jira_get_myself: { product: "jira", op: "read" },
+  jira_get_ticket: { product: "jira", op: "read" },
+  jira_search: { product: "jira", op: "read" },
+  jira_search_users: { product: "jira", op: "read" },
+  jira_get_changelog: { product: "jira", op: "read" },
+  jira_list_instances: { product: "jira", op: "read" },
+  jira_get_teams: { product: "jira", op: "read" },
+  jira_get_link_types: { product: "jira", op: "read" },
+  jira_get_transitions: { product: "jira", op: "read" },
+  jira_get_worklogs: { product: "jira", op: "read" },
+  jira_get_sprints: { product: "jira", op: "read" },
+  jira_get_boards: { product: "jira", op: "read" },
+  jira_get_issue_types: { product: "jira", op: "read" },
+  jira_get_priorities: { product: "jira", op: "read" },
+  jira_get_components: { product: "jira", op: "read" },
+  jira_get_versions: { product: "jira", op: "read" },
+  // ---- Jira writes (reversible) ----
+  jira_add_comment: { product: "jira", op: "write", category: "comment" },
+  jira_reply_comment: { product: "jira", op: "write", category: "comment" },
+  jira_edit_comment: { product: "jira", op: "write", category: "comment" },
+  jira_transition: { product: "jira", op: "write", category: "transition" },
+  jira_update_ticket: { product: "jira", op: "write", category: "ticket" },
+  jira_create_ticket: { product: "jira", op: "write", category: "ticket" },
+  jira_create_subtask: { product: "jira", op: "write", category: "ticket" },
+  jira_clone_ticket: { product: "jira", op: "write", category: "ticket" },
+  jira_link_tickets: { product: "jira", op: "write", category: "link" },
+  jira_unlink_tickets: { product: "jira", op: "write", category: "link" },
+  jira_add_attachment: { product: "jira", op: "write", category: "attachment" },
+  jira_add_watcher: { product: "jira", op: "write", category: "watcher" },
+  jira_remove_watcher: { product: "jira", op: "write", category: "watcher" },
+  jira_add_worklog: { product: "jira", op: "write", category: "worklog" },
+  jira_move_to_sprint: { product: "jira", op: "write", category: "sprint" },
+  jira_add_instance: { product: "jira", op: "write", category: "config" },
+  // ---- Jira destructive ----
+  jira_delete_comment: { product: "jira", op: "destructive", category: "comment" },
+  jira_delete_ticket: { product: "jira", op: "destructive", category: "ticket" },
+  jira_remove_attachment: { product: "jira", op: "destructive", category: "attachment" },
+  jira_remove_instance: { product: "jira", op: "destructive", category: "config" },
+  // ---- Confluence reads ----
+  confluence_get_spaces: { product: "confluence", op: "read" },
+  confluence_get_space: { product: "confluence", op: "read" },
+  confluence_search: { product: "confluence", op: "read" },
+  confluence_get_recent_pages: { product: "confluence", op: "read" },
+  confluence_get_space_root_pages: { product: "confluence", op: "read" },
+  confluence_get_page_children: { product: "confluence", op: "read" },
+  confluence_get_page: { product: "confluence", op: "read" },
+  confluence_get_comments: { product: "confluence", op: "read" },
+  confluence_get_labels: { product: "confluence", op: "read" },
+  confluence_list_attachments: { product: "confluence", op: "read" },
+  confluence_download_attachment: { product: "confluence", op: "read" },
+  // ---- Confluence writes ----
+  confluence_create_space: { product: "confluence", op: "write", category: "space" },
+  confluence_update_space: { product: "confluence", op: "write", category: "space" },
+  confluence_add_comment: { product: "confluence", op: "write", category: "comment" },
+  confluence_update_page: { product: "confluence", op: "write", category: "page" },
+  confluence_create_page: { product: "confluence", op: "write", category: "page" },
+  confluence_add_label: { product: "confluence", op: "write", category: "label" },
+  confluence_remove_label: { product: "confluence", op: "write", category: "label" },
+  confluence_upload_attachment: { product: "confluence", op: "write", category: "attachment" },
+  // ---- Confluence destructive ----
+  confluence_delete_space: { product: "confluence", op: "destructive", category: "space" },
+  confluence_delete_page: { product: "confluence", op: "destructive", category: "page" },
+};
+
+const COMMENT_TOOLS = new Set([
+  "jira_add_comment",
+  "jira_reply_comment",
+  "jira_edit_comment",
+  "confluence_add_comment",
+]);
+
+const SCOPE_PRESETS = {
+  "read-only": (m) => m.op === "read",
+  "comments-only": (m, name) => m.op === "read" || COMMENT_TOOLS.has(name),
+  "no-destructive": (m) => m.op !== "destructive",
+  unrestricted: () => true,
+};
+
+function checkScope(toolName, instance) {
+  const scopes = instance && instance.scopes;
+  // Fail-open when instance has no scopes block — preserves existing installs.
+  if (!scopes) return { allowed: true };
+
+  const meta = TOOL_METADATA[toolName];
+  // Unknown tool with scopes configured → fail closed.
+  if (!meta) {
+    return { allowed: false, reason: `Tool '${toolName}' has no metadata; denied under scoped instance '${instance.name}'.` };
+  }
+
+  // Explicit deny wins.
+  if (Array.isArray(scopes.deny) && scopes.deny.includes(toolName)) {
+    return { allowed: false, reason: `Tool '${toolName}' is in instance '${instance.name}' deny list.` };
+  }
+  // Explicit allow wins after deny.
+  if (Array.isArray(scopes.allow) && scopes.allow.includes(toolName)) {
+    return { allowed: true };
+  }
+  // Preset.
+  if (scopes.preset) {
+    const presetFn = SCOPE_PRESETS[scopes.preset];
+    if (!presetFn) {
+      return { allowed: false, reason: `Unknown scope preset '${scopes.preset}' on instance '${instance.name}'.` };
+    }
+    if (presetFn(meta, toolName)) return { allowed: true };
+    return { allowed: false, reason: `Tool '${toolName}' (${meta.op}) not permitted by preset '${scopes.preset}' on '${instance.name}'.` };
+  }
+  // scopes block present but neither preset nor allow listed → deny.
+  return { allowed: false, reason: `Tool '${toolName}' not in instance '${instance.name}' allow list.` };
+}
+
+// ---- Dry-run resolution ----
+const DRY_RUN_ENV =
+  process.env.JIRA_MCP_DRY_RUN === "1" ||
+  process.env.JIRA_MCP_DRY_RUN === "true";
+
+function resolveDryRun(toolName, args, instance) {
+  const meta = TOOL_METADATA[toolName];
+  if (!meta || meta.op === "read") return false;
+  if (args && args.dryRun === true) return true;
+  if (args && args.dryRun === false) return false;
+  if (instance && instance.dryRun === true) return true;
+  return DRY_RUN_ENV;
+}
+
+// Dry-run execution context. fetchJira/fetchConfluence check this and short-
+// circuit. Only the FIRST write in a chain is captured — multi-write tools
+// (e.g. transition with intermediate steps) report just step 1 with a note.
+const DRY_RUN_ABORT = Symbol("jira-mcp.dry-run-abort");
+const _policyCtx = { dryRun: false, plan: null };
+
+function recordDryRunCall(call) {
+  if (_policyCtx.plan) _policyCtx.plan.push(call);
+  throw DRY_RUN_ABORT;
+}
+
+// ---- Audit log ----
+const AUDIT_LOG_PATH = path.join(
+  process.env.HOME || "/tmp",
+  ".config/jira-mcp/audit.log",
+);
+const AUDIT_LOG_MAX_BYTES = 10 * 1024 * 1024;
+const AUDIT_LOG_KEEP = 5;
+const SECRET_KEY_PATTERN =
+  /^(token|auth|authorization|password|secret|api[_-]?key|file[_-]?content)$/i;
+
+function scrubArgs(value) {
+  if (value == null) return value;
+  if (Array.isArray(value)) return value.map(scrubArgs);
+  if (typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (SECRET_KEY_PATTERN.test(k)) {
+        out[k] = "[REDACTED]";
+      } else if (typeof v === "string" && v.length > 4000) {
+        out[k] = v.slice(0, 4000) + `…[truncated ${v.length - 4000} chars]`;
+      } else {
+        out[k] = scrubArgs(v);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
+function rotateAuditIfNeeded() {
+  try {
+    const stat = fs.statSync(AUDIT_LOG_PATH);
+    if (stat.size < AUDIT_LOG_MAX_BYTES) return;
+  } catch {
+    return; // file does not exist yet
+  }
+  // Shift audit.log.N → audit.log.N+1
+  for (let i = AUDIT_LOG_KEEP - 1; i >= 1; i--) {
+    const src = `${AUDIT_LOG_PATH}.${i}`;
+    const dst = `${AUDIT_LOG_PATH}.${i + 1}`;
+    try { if (fs.existsSync(src)) fs.renameSync(src, dst); } catch {}
+  }
+  try { fs.renameSync(AUDIT_LOG_PATH, `${AUDIT_LOG_PATH}.1`); } catch {}
+}
+
+function audit(entry) {
+  try {
+    if (auditConfig.enabled === false) return;
+    const auditDir = path.dirname(AUDIT_LOG_PATH);
+    if (!fs.existsSync(auditDir)) fs.mkdirSync(auditDir, { recursive: true });
+    rotateAuditIfNeeded();
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n";
+    fs.appendFileSync(AUDIT_LOG_PATH, line);
+  } catch {
+    // Audit failures must not block real writes.
+  }
+}
+
+// ---- Rate limiter (token buckets) ----
+let _clock = () => Date.now();
+function _setClockForTests(fn) { _clock = fn; }
+
+// Buckets are populated lazily. Defaults are conservative-but-not-annoying.
+// User can override via config.rateLimit = { enabled: bool, global: N, perInstance: N, destructive: N }.
+const DEFAULT_RL = { enabled: true, global: 60, perInstance: 30, destructive: 5 };
+let _rlConfig = { ...DEFAULT_RL };
+const _buckets = new Map();
+
+function _bucket(key, capacity) {
+  let b = _buckets.get(key);
+  if (!b) {
+    b = { tokens: capacity, lastRefill: _clock(), capacity };
+    _buckets.set(key, b);
+  }
+  return b;
+}
+
+function _refill(b, refillPerMin) {
+  const now = _clock();
+  const elapsed = now - b.lastRefill;
+  if (elapsed <= 0) return;
+  const refill = (elapsed / 60000) * refillPerMin;
+  b.tokens = Math.min(b.capacity, b.tokens + refill);
+  b.lastRefill = now;
+}
+
+function checkRateLimit(toolName, instance) {
+  if (_rlConfig.enabled === false) return { allowed: true };
+  const meta = TOOL_METADATA[toolName];
+  if (!meta || meta.op === "read") return { allowed: true };
+
+  const checks = [
+    { key: "global", capacity: _rlConfig.global },
+    { key: `instance:${instance.name}`, capacity: _rlConfig.perInstance },
+  ];
+  if (meta.op === "destructive") {
+    checks.push({ key: "destructive", capacity: _rlConfig.destructive });
+  }
+
+  for (const c of checks) {
+    const b = _bucket(c.key, c.capacity);
+    _refill(b, c.capacity);
+    if (b.tokens < 1) {
+      const retryAfter = Math.ceil(((1 - b.tokens) / c.capacity) * 60);
+      return { allowed: false, bucket: c.key, retryAfter };
+    }
+  }
+  // Consume from all relevant buckets atomically.
+  for (const c of checks) {
+    const b = _bucket(c.key, c.capacity);
+    b.tokens -= 1;
+  }
+  return { allowed: true };
+}
+
+function _resetBucketsForTests() {
+  _buckets.clear();
+  _rlConfig = { ...DEFAULT_RL };
+}
+
+// Pick up user overrides from config.
+let auditConfig = { enabled: true };
+if (rawConfig.audit && typeof rawConfig.audit === "object") {
+  auditConfig = { ...auditConfig, ...rawConfig.audit };
+}
+if (rawConfig.rateLimit && typeof rawConfig.rateLimit === "object") {
+  _rlConfig = { ..._rlConfig, ...rawConfig.rateLimit };
+}
+
+// Target extractor for audit log.
+function extractTarget(args) {
+  if (!args || typeof args !== "object") return undefined;
+  return (
+    args.issueKey ||
+    args.pageId ||
+    args.spaceKey ||
+    args.commentId ||
+    args.boardId ||
+    args.attachmentId ||
+    args.accountId ||
+    undefined
+  );
+}
+
+// Resolve instance for policy purposes (must run BEFORE the dispatch handler).
+// Routing keys vary by tool — issueKey is most common but subtask uses
+// parentKey, link uses inwardIssueKey, create_ticket uses projectKey, and
+// Confluence tools route by spaceKey. If a tool genuinely targets a specific
+// instance via no key (e.g. jira_get_boards), it falls back to the default
+// instance — the user can still override with args.instance.
+function resolveInstanceForTool(toolName, args) {
+  if (!args) return defaultInstance;
+  if (args.instance) return getInstanceByName(args.instance);
+  const keyLike =
+    args.issueKey ||
+    args.parentKey ||
+    args.inwardIssueKey ||
+    args.outwardIssueKey;
+  if (keyLike) return getInstanceForKey(keyLike);
+  const projectLike = args.projectKey || args.spaceKey;
+  if (projectLike) return getInstanceForProject(projectLike);
+  return defaultInstance;
+}
+
 // ============ JIRA FUNCTIONS ============
 
 async function fetchJira(endpoint, options = {}, instance = defaultInstance) {
   const { method = "GET", body } = options;
+  if (_policyCtx.dryRun && method !== "GET" && method !== "HEAD") {
+    recordDryRunCall({ api: "jira", method, endpoint, body, instance: instance.name });
+  }
   const headers = {
     Authorization: `Basic ${instance.auth}`,
     Accept: "application/json",
@@ -162,6 +473,9 @@ async function fetchJira(endpoint, options = {}, instance = defaultInstance) {
 
 async function fetchJiraAgile(endpoint, options = {}, instance = defaultInstance) {
   const { method = "GET", body } = options;
+  if (_policyCtx.dryRun && method !== "GET" && method !== "HEAD") {
+    recordDryRunCall({ api: "jira-agile", method, endpoint, body, instance: instance.name });
+  }
   const headers = {
     Authorization: `Basic ${instance.auth}`,
     Accept: "application/json",
@@ -307,6 +621,15 @@ function getConfluenceBaseUrl(instance) {
 
 async function fetchConfluence(endpoint, options = {}, instance = defaultInstance) {
   const { method = "GET", body, rawBody, contentType, extraHeaders } = options;
+  if (_policyCtx.dryRun && method !== "GET" && method !== "HEAD") {
+    recordDryRunCall({
+      api: "confluence",
+      method,
+      endpoint,
+      body: body !== undefined ? body : rawBody !== undefined ? "<raw body>" : undefined,
+      instance: instance.name,
+    });
+  }
   const headers = {
     Authorization: `Basic ${instance.auth}`,
     Accept: "application/json",
@@ -1667,9 +1990,31 @@ const server = new Server(
   { capabilities: { tools: {} } },
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+// Inject `dryRun` into the schema of any mutating tool so MCP clients with
+// strict schema validation accept it as a per-call argument.
+function _injectDryRunSchema(tool) {
+  const meta = TOOL_METADATA[tool.name];
+  if (!meta || meta.op === "read") return tool;
+  const schema = tool.inputSchema || {};
+  const props = schema.properties || {};
+  if (props.dryRun) return tool;
   return {
-    tools: [
+    ...tool,
+    inputSchema: {
+      ...schema,
+      properties: {
+        ...props,
+        dryRun: {
+          type: "boolean",
+          description: "If true, return the HTTP request that would be sent (method, endpoint, body) without calling Atlassian. Multi-step tools only show the first write.",
+        },
+      },
+    },
+  };
+}
+
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  const rawTools = [
       {
         name: "jira_get_myself",
         description:
@@ -2924,14 +3269,126 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["pageId", "filename"],
         },
       },
-    ],
-  };
+    ];
+  return { tools: rawTools.map(_injectDryRunSchema) };
 });
+
+async function runWithPolicy(name, args, handler) {
+  const meta = TOOL_METADATA[name];
+  const inst = resolveInstanceForTool(name, args);
+
+  // 1. Scope check
+  const scopeResult = checkScope(name, inst);
+  if (!scopeResult.allowed) {
+    if (meta && meta.op !== "read") {
+      audit({
+        tool: name,
+        instance: inst.name,
+        target: extractTarget(args),
+        args: scrubArgs(args),
+        success: false,
+        deniedBy: "scope",
+        reason: scopeResult.reason,
+      });
+    }
+    return {
+      content: [{ type: "text", text: `Scope denied: ${scopeResult.reason}` }],
+      isError: true,
+    };
+  }
+
+  // 2. Resolve dry-run intent
+  const dryRun = resolveDryRun(name, args, inst);
+
+  // 3. Rate limit — real writes only (dry-runs do not consume quota)
+  if (!dryRun && meta && (meta.op === "write" || meta.op === "destructive")) {
+    const rl = checkRateLimit(name, inst);
+    if (!rl.allowed) {
+      audit({
+        tool: name,
+        instance: inst.name,
+        target: extractTarget(args),
+        args: scrubArgs(args),
+        success: false,
+        deniedBy: "rate-limit",
+        bucket: rl.bucket,
+        retryAfter: rl.retryAfter,
+      });
+      return {
+        content: [{
+          type: "text",
+          text: `Rate limit exceeded (bucket: ${rl.bucket}). Retry after ${rl.retryAfter}s.`,
+        }],
+        isError: true,
+      };
+    }
+  }
+
+  // 4. Execute under policy context
+  _policyCtx.dryRun = dryRun;
+  _policyCtx.plan = dryRun ? [] : null;
+  try {
+    const result = await handler();
+    if (meta && meta.op !== "read") {
+      audit({
+        tool: name,
+        instance: inst.name,
+        target: extractTarget(args),
+        args: scrubArgs(args),
+        dryRun,
+        success: true,
+      });
+    }
+    return result;
+  } catch (error) {
+    if (error === DRY_RUN_ABORT) {
+      const plan = _policyCtx.plan || [];
+      audit({
+        tool: name,
+        instance: inst.name,
+        target: extractTarget(args),
+        args: scrubArgs(args),
+        dryRun: true,
+        success: true,
+        status: "dry-run",
+        plan,
+      });
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            dryRun: true,
+            note: "Plan shows the first HTTP write only. Multi-step tools (e.g. jira_transition with intermediate steps) execute the remaining writes when run for real.",
+            plan,
+          }, null, 2),
+        }],
+      };
+    }
+    if (meta && meta.op !== "read") {
+      audit({
+        tool: name,
+        instance: inst.name,
+        target: extractTarget(args),
+        args: scrubArgs(args),
+        dryRun,
+        success: false,
+        error: error.message,
+      });
+    }
+    return {
+      content: [{ type: "text", text: `Error: ${error.message}` }],
+      isError: true,
+    };
+  } finally {
+    _policyCtx.dryRun = false;
+    _policyCtx.plan = null;
+  }
+}
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
-  try {
+  return runWithPolicy(name, args, async () => {
     if (name === "jira_get_myself") {
       const inst = getInstanceByName(args.instance);
       const result = await fetchJira("/myself", {}, inst);
@@ -3488,11 +3945,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      // Save without the computed auth field
-      const toSave = { name: instName, email, token, baseUrl, projects };
+      // Save without the computed auth field. Preserve any safety/observability
+      // fields the user has configured on the existing instance (scopes, dryRun,
+      // confluenceBaseUrl) so they survive a re-run of jira_add_instance.
+      const savedIdx = savedConfig.instances.findIndex((i) => i.name === instName);
+      const prevSaved = savedIdx >= 0 ? savedConfig.instances[savedIdx] : {};
+      const toSave = {
+        ...prevSaved,
+        name: instName,
+        email,
+        token,
+        baseUrl,
+        projects,
+      };
       if (defaultTeam) toSave.defaultTeam = defaultTeam;
       if (Object.keys(projectTeams).length > 0) toSave.projectTeams = projectTeams;
-      const savedIdx = savedConfig.instances.findIndex((i) => i.name === instName);
       if (savedIdx >= 0) {
         savedConfig.instances[savedIdx] = toSave;
       } else {
@@ -3827,6 +4294,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         fileBuffer,
         Buffer.from(footer),
       ]);
+
+      if (_policyCtx.dryRun) {
+        recordDryRunCall({
+          api: "jira",
+          method: "POST",
+          endpoint: `/issue/${args.issueKey}/attachments`,
+          body: `<multipart upload: ${fileName}, ${fileBuffer.length} bytes>`,
+          instance: inst.name,
+        });
+      }
 
       const response = await fetch(
         `${inst.baseUrl}/rest/api/3/issue/${args.issueKey}/attachments`,
@@ -4718,6 +5195,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const bodyBuffer = Buffer.concat(parts);
 
       const url = `${getConfluenceBaseUrl(inst)}/rest/api/content/${encodeURIComponent(args.pageId)}/child/attachment`;
+      if (_policyCtx.dryRun) {
+        recordDryRunCall({
+          api: "confluence",
+          method: "POST",
+          endpoint: `/rest/api/content/${args.pageId}/child/attachment`,
+          body: `<multipart upload: ${fileName}, ${fileBuffer.length} bytes>`,
+          instance: inst.name,
+        });
+      }
       const response = await fetch(url, {
         method: "POST",
         headers: {
@@ -4755,12 +5241,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } else {
       throw new Error(`Unknown tool: ${name}`);
     }
-  } catch (error) {
-    return {
-      content: [{ type: "text", text: `Error: ${error.message}` }],
-      isError: true,
-    };
-  }
+  });
 });
 
 async function main() {
@@ -4774,5 +5255,14 @@ if (require.main === module) {
 
 // Export for testing
 if (typeof module !== "undefined") {
-  module.exports = { buildCommentADF, parseInlineFormatting, autoLinkTextNodes, findJiraTicketKeys, resolveTeamId, fetchJiraTeams, listTeams, searchTeamsViaJql, fetchConfluence, getConfluenceBaseUrl, textToConfluenceStorage, htmlEscape };
+  module.exports = {
+    buildCommentADF, parseInlineFormatting, autoLinkTextNodes, findJiraTicketKeys,
+    resolveTeamId, fetchJiraTeams, listTeams, searchTeamsViaJql,
+    fetchConfluence, getConfluenceBaseUrl, textToConfluenceStorage, htmlEscape,
+    // Policy module exports
+    TOOL_METADATA, checkScope, resolveDryRun, scrubArgs, extractTarget,
+    checkRateLimit, _setClockForTests, _resetBucketsForTests,
+    resolveInstanceForTool, _injectDryRunSchema,
+    AUDIT_LOG_PATH,
+  };
 }
