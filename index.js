@@ -2051,7 +2051,7 @@ function _injectDryRunSchema(tool) {
 const DESC_FORMAT_GUIDE =
   " For a professional look, structure the text with Markdown: open with a one or two sentence overview, then use ## / ### headings for sections (e.g. Overview, Details, Acceptance Criteria), '-' or '*' bullet lists (indent two spaces for sub-items) for enumerations, numbered lists for ordered steps, Markdown tables for structured data, **bold** for key terms, and fenced ``` code blocks for code or payloads. Put a blank line between blocks. Keep it concise and scannable.";
 const COMMENT_FORMAT_GUIDE =
-  " For a professional look, write polished, scannable Markdown: lead with a one line summary, use '-' bullets for multiple points and **bold** for key items, and add short ### sub-headings only when the comment is long. Keep paragraphs short.";
+  " Write one short conversational paragraph: start with @DisplayName of who to notify, say what changed (keep it high level for non-developers; include technical specifics like endpoints or payloads only when the reader is a developer and it makes sense), and end with the next step (e.g. 'Ready for verification.' or 'Please verify on TRAIN.'). Avoid bullet lists, headings, and bold unless the update genuinely needs them.";
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   const rawTools = [
@@ -2127,7 +2127,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_add_comment",
         description:
-          "Add a comment to a Jira ticket. IMPORTANT RULES: (1) Write comments at a HIGH LEVEL for stakeholders, product owners, and managers. Focus on WHAT was done and the business impact, NOT how it was done. Example: 'Implemented the new filtering feature for the dashboard' instead of 'Added a useEffect hook with debounced API calls to filter endpoint'. (2) NEVER mention technical details: no code, no function names, no file paths, no git branches, no commit hashes, no 'pushed to main', no framework-specific terms (React, Angular, hooks, components, etc.). (3) Use @DisplayName (e.g. @Julia Pereszta) for mentions, NOT [~accountId:...] syntax. (4) NEVER use em dashes (—) or en dashes (–), use commas, periods, or rewrite the sentence instead.",
+          "Add a comment to a Jira ticket. RULES: (1) Default to a HIGH LEVEL update for stakeholders, product owners, and QA, focus on WHAT changed and the impact, not how it was built (e.g. 'Implemented the new dashboard filtering' not 'added a debounced useEffect hook'). (2) Include technical detail ONLY when it makes sense for a developer reader, such as specifying endpoints, request payloads, or API contracts for another developer; otherwise leave out code, file paths, branch names, commit hashes, 'pushed to main', and framework-internal terms. (3) Use @DisplayName (e.g. @Julia Pereszta) for mentions, NOT [~accountId:...] syntax. (4) NEVER use em dashes (—) or en dashes (–), use commas, periods, or rewrite the sentence instead.",
         inputSchema: {
           type: "object",
           properties: {
@@ -2178,7 +2178,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_edit_comment",
         description:
-          "Edit an existing comment on a Jira ticket. Replaces the comment text. IMPORTANT: Use @DisplayName (e.g. @Julia Pereszta) for mentions — NOT [~accountId:...] syntax. Keep comments non-technical and user-facing. Never mention git details like 'pushed to main', branch names, or technical implementation details.",
+          "Edit an existing comment on a Jira ticket. Replaces the comment text. Keep it high level for non-developers, and include technical detail (endpoints, payloads, API contracts) only when it makes sense for a developer reader. Use @DisplayName (e.g. @Julia Pereszta) for mentions, NOT [~accountId:...] syntax. NEVER use em dashes (—) or en dashes (–), use commas, periods, or rewrite the sentence instead.",
         inputSchema: {
           type: "object",
           properties: {
