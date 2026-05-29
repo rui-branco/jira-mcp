@@ -758,7 +758,10 @@ function extractText(content, urls = []) {
       } else if (node.type === "hardBreak") {
         text += "\n";
       } else if (node.type === "mention") {
-        text += `@${node.attrs?.text || "user"}`;
+        // attrs.text already includes the leading "@" (e.g. "@Rui Branco").
+        // Don't prepend a second one.
+        const mentionText = node.attrs?.text || "@user";
+        text += mentionText.startsWith("@") ? mentionText : `@${mentionText}`;
       } else if (node.type === "mediaGroup" || node.type === "mediaSingle") {
         text += "[image attachment]\n";
       } else if (
@@ -965,6 +968,54 @@ function autoLinkTextNodes(nodes, instance = defaultInstance) {
   return result;
 }
 
+// Detect a markdown list item line. Returns {indent, ordered, text} or null.
+// Bullets: -, *, + followed by a space. Ordered: "1." or "1)" followed by a space.
+// The marker must be followed by whitespace so inline emphasis (*italic*) and
+// horizontal rules (***) are NOT misread as list items.
+function listItemMatch(line) {
+  const m = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+  if (!m) return null;
+  return { indent: m[1].length, ordered: /\d/.test(m[2]), text: m[3] };
+}
+
+// Recursively parse a (possibly nested) markdown list starting at lines[startIdx].
+// baseIndent is the indentation of items at this level; more-indented items are
+// folded into the previous item as a nested list. Returns {node, nextIndex}.
+async function parseListBlock(lines, startIdx, baseIndent, instance) {
+  const items = [];
+  let i = startIdx;
+  let ordered = null;
+  while (i < lines.length) {
+    if (!lines[i].trim()) break; // blank line ends the list
+    const m = listItemMatch(lines[i]);
+    if (!m) break;
+    if (m.indent < baseIndent) break; // dedent: belongs to a parent list
+    if (m.indent > baseIndent) {
+      // Deeper indent: nest under the previous item at this level.
+      const sub = await parseListBlock(lines, i, m.indent, instance);
+      if (items.length > 0) {
+        items[items.length - 1].content.push(sub.node);
+      } else {
+        items.push({ type: "listItem", content: [sub.node] });
+      }
+      i = sub.nextIndex;
+      continue;
+    }
+    if (ordered === null) ordered = m.ordered; // list type set by first item
+    else if (m.ordered !== ordered) break; // marker switched: caller starts a new list
+    const inlineContent = await parseInlineFormatting(m.text, instance);
+    items.push({
+      type: "listItem",
+      content: [{ type: "paragraph", content: inlineContent }],
+    });
+    i++;
+  }
+  return {
+    node: { type: ordered ? "orderedList" : "bulletList", content: items },
+    nextIndex: i,
+  };
+}
+
 // Parse text with markdown formatting and @mentions, build ADF content
 async function buildCommentADF(text, instance = defaultInstance) {
   // Sanitize: replace em dashes and en dashes with hyphen
@@ -1077,35 +1128,17 @@ async function buildCommentADF(text, instance = defaultInstance) {
       continue;
     }
 
-    // --- Bullet list (- items) ---
-    if (trimmed.startsWith("- ")) {
-      const listItems = [];
-      while (i < lines.length && lines[i].trim().startsWith("- ")) {
-        const itemText = lines[i].trim().substring(2);
-        const inlineContent = await parseInlineFormatting(itemText, instance);
-        listItems.push({
-          type: "listItem",
-          content: [{ type: "paragraph", content: inlineContent }],
-        });
-        i++;
-      }
-      content.push({ type: "bulletList", content: listItems });
-      continue;
-    }
-
-    // --- Ordered list (1. items) ---
-    if (/^\d+\.\s/.test(trimmed)) {
-      const listItems = [];
-      while (i < lines.length && /^\d+\.\s/.test(lines[i].trim())) {
-        const itemText = lines[i].trim().replace(/^\d+\.\s/, "");
-        const inlineContent = await parseInlineFormatting(itemText, instance);
-        listItems.push({
-          type: "listItem",
-          content: [{ type: "paragraph", content: inlineContent }],
-        });
-        i++;
-      }
-      content.push({ type: "orderedList", content: listItems });
+    // --- Lists (bullet -,*,+ or ordered 1./1)) with nesting ---
+    const listStart = listItemMatch(line);
+    if (listStart) {
+      const { node, nextIndex } = await parseListBlock(
+        lines,
+        i,
+        listStart.indent,
+        instance,
+      );
+      content.push(node);
+      i = nextIndex;
       continue;
     }
 
@@ -1115,13 +1148,12 @@ async function buildCommentADF(text, instance = defaultInstance) {
       i < lines.length &&
       lines[i].trim() &&
       !lines[i].trim().startsWith("```") &&
-      !lines[i].trim().startsWith("# ") &&
-      !lines[i].trim().startsWith("## ") &&
-      !lines[i].trim().startsWith("### ") &&
+      !/^#{1,6}\s/.test(lines[i].trim()) &&
       !lines[i].trim().startsWith("> ") &&
-      !lines[i].trim().startsWith("- ") &&
-      !/^\d+\.\s/.test(lines[i].trim()) &&
+      !listItemMatch(lines[i]) &&
       !/^-{3,}$/.test(lines[i].trim()) &&
+      !/^\*{3,}$/.test(lines[i].trim()) &&
+      !/^_{3,}$/.test(lines[i].trim()) &&
       !(lines[i].trim().startsWith("|") && lines[i].trim().endsWith("|"))
     ) {
       if (paragraphContent.length > 0) paragraphContent.push({ type: "hardBreak" });
