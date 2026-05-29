@@ -1,6 +1,6 @@
 # Jira MCP Server
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that brings Jira ticket context directly into Claude Code. Fetch complete ticket information including descriptions, comments, attachments, and linked Figma designs without leaving your development environment.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that brings Jira ticket context directly into any MCP-compatible AI client — Claude Code, Codex CLI, Google's Antigravity (Gemini), Cursor, Windsurf, Zed, and others. Fetch complete ticket information including descriptions, comments, attachments, and linked Figma designs without leaving your development environment.
 
 ## Overview
 
@@ -9,7 +9,7 @@ When working on development tasks, context switching between Jira and your code 
 - **Fetching complete ticket context** - Get descriptions, comments, status, and metadata instantly
 - **Downloading attachments** - Image attachments are downloaded and displayed inline
 - **Auto-fetching Figma designs** - Linked Figma URLs are automatically detected and exported as images
-- **Enabling natural queries** - Search tickets with JQL directly from Claude Code
+- **Enabling natural queries** - Search tickets with JQL directly from your AI client
 
 ## Features
 
@@ -27,20 +27,44 @@ When working on development tasks, context switching between Jira and your code 
 ### Prerequisites
 
 - Node.js 18+
-- [Claude Code](https://claude.ai/code) CLI
+- An MCP-compatible AI client (see [Step 1](#step-1-register-with-your-mcp-client) below)
 - Jira Cloud account with API access
 
-### Step 1: Add to Claude Code
+### Step 1: Register with your MCP client
+
+Pick the snippet for your client. All of them launch the server over stdio.
+
+**Claude Code:**
 
 ```bash
 claude mcp add --transport stdio jira -- npx -y @rui.branco/jira-mcp
 ```
 
+**Codex CLI:** add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.jira]
+command = "npx"
+args = ["-y", "@rui.branco/jira-mcp"]
+```
+
+**Google Antigravity / Gemini CLI:** add to `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "jira": { "command": "npx", "args": ["-y", "@rui.branco/jira-mcp"] }
+  }
+}
+```
+
+**Cursor, Windsurf, Zed, Cline, Continue, etc.:** add the same `command`/`args` pair to whatever JSON config that client uses for MCP servers (the exact path varies, but the shape is standard across clients).
+
 ### Step 2: Get Your Jira API Token
 
 1. Go to [Atlassian API Tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
 2. Click **"Create API token"**
-3. Enter a label (e.g., "Claude Code MCP")
+3. Enter a label (e.g., "jira-mcp")
 4. Click **"Create"**
 5. Copy the token (you won't be able to see it again)
 
@@ -66,7 +90,7 @@ npx @rui.branco/jira-mcp setup
 
 ### Step 4: Verify
 
-Restart Claude Code and run `/mcp` to verify the server is connected.
+Restart your AI client and check its MCP status (e.g. `/mcp` in Claude Code, `mcp` in Codex CLI, or the equivalent panel in your client) to verify the server is connected.
 
 ### Alternative: Manual Installation
 
@@ -78,7 +102,7 @@ cd ~/.config/jira-mcp && npm install
 node setup.js
 ```
 
-Then add to Claude Code:
+Then register the local entry point with your MCP client (replace the `npx -y @rui.branco/jira-mcp` command from Step 1 with `node $HOME/.config/jira-mcp/index.js`). Example for Claude Code:
 
 ```bash
 claude mcp add --transport stdio jira -- node $HOME/.config/jira-mcp/index.js
@@ -146,11 +170,11 @@ This MCP automatically detects Figma URLs in ticket descriptions and comments. W
 - Figma links are automatically fetched
 - Large frames are split into sections for better readability
 - Images are exported at 2x scale for clarity
-- All images are displayed inline in Claude Code
+- All images are displayed inline in clients that support image content blocks (Claude Code, Codex, Antigravity, etc.)
 
 To enable Figma integration:
 1. Install and configure [figma-mcp](https://github.com/rui-branco/figma-mcp)
-2. Restart Claude Code
+2. Restart your AI client
 3. Figma links will be auto-fetched when you get a ticket
 
 ## API Reference
@@ -269,7 +293,7 @@ Three layers of precedence (most-specific wins):
 
 1. **Per call:** pass `dryRun: true` to any mutating tool.
 2. **Per instance:** add `"dryRun": true` to an instance in `config.json`.
-3. **Environment:** export `JIRA_MCP_DRY_RUN=1` before launching Claude Code.
+3. **Environment:** export `JIRA_MCP_DRY_RUN=1` before launching your AI client.
 
 Read tools ignore the flag. The response looks like:
 
@@ -317,5 +341,5 @@ MIT
 
 ## Related
 
-- [figma-mcp](https://github.com/rui-branco/figma-mcp) - Figma MCP server for Claude Code
+- [figma-mcp](https://github.com/rui-branco/figma-mcp) - Figma MCP server (works with any MCP-compatible AI client)
 - [Model Context Protocol](https://modelcontextprotocol.io/) - MCP specification
