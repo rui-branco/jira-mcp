@@ -2045,6 +2045,14 @@ function _injectDryRunSchema(tool) {
   };
 }
 
+// Additive formatting guidance appended to description/comment field prompts so
+// generated content renders as clean, professional Jira (ADF). Does not replace
+// any existing rule — it is concatenated after the current field descriptions.
+const DESC_FORMAT_GUIDE =
+  " For a professional look, structure the text with Markdown: open with a one or two sentence overview, then use ## / ### headings for sections (e.g. Overview, Details, Acceptance Criteria), '-' or '*' bullet lists (indent two spaces for sub-items) for enumerations, numbered lists for ordered steps, Markdown tables for structured data, **bold** for key terms, and fenced ``` code blocks for code or payloads. Put a blank line between blocks. Keep it concise and scannable.";
+const COMMENT_FORMAT_GUIDE =
+  " For a professional look, write polished, scannable Markdown: lead with a one line summary, use '-' bullets for multiple points and **bold** for key items, and add short ### sub-headings only when the comment is long. Keep paragraphs short.";
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   const rawTools = [
       {
@@ -2127,7 +2135,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description: "The Jira issue key (e.g., MODS-123)",
             },
-            comment: { type: "string", description: "The comment text to add" },
+            comment: {
+              type: "string",
+              description: "The comment text to add." + COMMENT_FORMAT_GUIDE,
+            },
             instance: {
               type: "string",
               description: "Instance name override. Auto-detected from issue key prefix if omitted.",
@@ -2152,7 +2163,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "The ID of the comment to reply to. Use jira_get_ticket to see comments and their IDs.",
             },
-            reply: { type: "string", description: "The reply text" },
+            reply: {
+              type: "string",
+              description: "The reply text." + COMMENT_FORMAT_GUIDE,
+            },
             instance: {
               type: "string",
               description: "Instance name override. Auto-detected from issue key prefix if omitted.",
@@ -2177,7 +2191,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "The ID of the comment to edit. Use jira_get_ticket to see comments and their IDs.",
             },
-            comment: { type: "string", description: "The new comment text" },
+            comment: {
+              type: "string",
+              description: "The new comment text." + COMMENT_FORMAT_GUIDE,
+            },
             instance: {
               type: "string",
               description: "Instance name override. Auto-detected from issue key prefix if omitted.",
@@ -2263,7 +2280,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: {
               type: "string",
               description:
-                "Text to add to the description. By default APPENDS to existing content. Set replaceDescription=true to replace instead.",
+                "Text to add to the description. By default APPENDS to existing content. Set replaceDescription=true to replace instead." +
+                DESC_FORMAT_GUIDE,
             },
             replaceDescription: {
               type: "boolean",
@@ -2467,7 +2485,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             description: {
               type: "string",
-              description: "The issue description text. Supports @mentions via @DisplayName.",
+              description:
+                "The issue description text. Supports @mentions via @DisplayName." +
+                DESC_FORMAT_GUIDE,
             },
             assignee: {
               type: "string",
@@ -2533,7 +2553,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             description: {
               type: "string",
-              description: "The subtask description text. Supports @mentions via @DisplayName.",
+              description:
+                "The subtask description text. Supports @mentions via @DisplayName." +
+                DESC_FORMAT_GUIDE,
             },
             assignee: {
               type: "string",
