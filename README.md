@@ -225,6 +225,19 @@ For Server / Data Center deployments where Confluence lives on a different host,
 
 **Why ADF for `confluence_get_page`?** The v1 `body.atlas_doc_format` expand is unreliable on modern Cloud pages — table cell background colors and some newer node types only survive the v2 `/api/v2/pages/<id>?body-format=atlas_doc_format` endpoint. `confluence_get_page` therefore does both requests in parallel and merges the v2 ADF body onto the v1 response, so callers get `body.view`, `body.storage` and `body.atlas_doc_format` in one shot.
 
+### Confluence On-Demand Activation
+
+By default, the 21 `confluence_*` tools are hidden from `tools/list` to reduce token footprint. A lightweight `confluence_enable` gateway tool is exposed instead. When a task needs Confluence, the client calls `confluence_enable` and the full tool set appears (the server sends `notifications/tools/list_changed`). Activation is per-process (not persisted to config) and does not bypass instance scopes.
+
+To expose Confluence tools from boot (skip the activation step), set the `confluence` config key or the `JIRA_MCP_CONFLUENCE` environment variable:
+
+| Method | Value |
+|--------|-------|
+| Config (`~/.config/jira-mcp/config.json`) | `"confluence": "always"` |
+| Environment variable | `JIRA_MCP_CONFLUENCE=always` |
+
+The default value is `"on-demand"`.
+
 ### Configuration
 
 Config stored at `~/.config/jira-mcp/config.json`:

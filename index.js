@@ -53,6 +53,15 @@ const jiraConfigPath = path.join(
 );
 const rawConfig = JSON.parse(fs.readFileSync(jiraConfigPath, "utf8"));
 
+// Confluence tool visibility: 'on-demand' (default) hides the confluence_*
+// tools until confluence_enable is called; 'always' exposes them from boot.
+// Env JIRA_MCP_CONFLUENCE overrides the config key.
+const confluenceMode = String(process.env.JIRA_MCP_CONFLUENCE || rawConfig.confluence || "on-demand").toLowerCase();
+if (confluenceMode !== "always" && confluenceMode !== "on-demand") {
+  console.error(`jira-mcp: invalid confluence mode "${confluenceMode}", falling back to "on-demand"`);
+}
+let confluenceActive = confluenceMode === "always";
+
 // Normalize config to multi-instance format
 let instances;
 if (rawConfig.instances) {
@@ -181,6 +190,8 @@ const TOOL_METADATA = {
   jira_delete_ticket: { product: "jira", op: "destructive", category: "ticket" },
   jira_remove_attachment: { product: "jira", op: "destructive", category: "attachment" },
   jira_remove_instance: { product: "jira", op: "destructive", category: "config" },
+  // ---- Confluence activation ----
+  confluence_enable: { product: "confluence", op: "read" },
   // ---- Confluence reads ----
   confluence_get_spaces: { product: "confluence", op: "read" },
   confluence_get_space: { product: "confluence", op: "read" },
@@ -2017,9 +2028,20 @@ async function getChangelogsBulk(jql, maxResults = 50, instance = defaultInstanc
 
 // ============ MCP SERVER ============
 
+const SERVER_INSTRUCTIONS = `# jira-mcp usage rules
+
+- \`instance\` (optional, on most tools): multi-instance setups only. Omit it — it auto-detects from the issue key prefix, else uses the default instance.
+- \`dryRun\` (optional, on mutating tools): if true, returns the HTTP request that would be sent (method, endpoint, body) without calling Atlassian. Multi-step tools only show the first write.
+${confluenceMode !== "always" ? "- Confluence tools are hidden until activated: call `confluence_enable` first when a task needs Confluence (pages, spaces, page comments, labels, attachments).\n" : ""}
+## Writing Jira comments (jira_add_comment / jira_reply_comment / jira_edit_comment)
+Write one short conversational paragraph: start with @DisplayName of who to notify (NOT [~accountId:...] syntax), say what changed, and end with the next step (e.g. 'Ready for verification.'). Keep it HIGH LEVEL for stakeholders/PO/QA — WHAT changed and the impact, not how it was built. Include technical detail (endpoints, payloads, API contracts) ONLY when the reader is a developer and it makes sense; otherwise leave out code, file paths, branch names, commit hashes, and framework-internal terms. NEVER use em dashes (—) or en dashes (–) — use commas, periods, or rewrite. Avoid bullet lists, headings, and bold unless the update genuinely needs them.
+
+## Writing descriptions (jira_create_ticket / jira_update_ticket / jira_create_subtask)
+Structure with Markdown: a one/two-sentence overview, then ## / ### headings (Overview, Details, Acceptance Criteria), '-' bullet lists, numbered steps, tables for structured data, **bold** key terms, fenced \`\`\` blocks for code/payloads. Blank line between blocks. Concise and scannable. Never use em/en dashes.`;
+
 const server = new Server(
   { name: "jira-mcp", version: "1.0.0" },
-  { capabilities: { tools: {} } },
+  { capabilities: { tools: { listChanged: true } }, instructions: SERVER_INSTRUCTIONS },
 );
 
 // Inject `dryRun` into the schema of any mutating tool so MCP clients with
@@ -2038,20 +2060,15 @@ function _injectDryRunSchema(tool) {
         ...props,
         dryRun: {
           type: "boolean",
-          description: "If true, return the HTTP request that would be sent (method, endpoint, body) without calling Atlassian. Multi-step tools only show the first write.",
+          description: "Preview: return the would-be HTTP request without executing.",
         },
       },
     },
   };
 }
 
-// Additive formatting guidance appended to description/comment field prompts so
-// generated content renders as clean, professional Jira (ADF). Does not replace
-// any existing rule — it is concatenated after the current field descriptions.
-const DESC_FORMAT_GUIDE =
-  " For a professional look, structure the text with Markdown: open with a one or two sentence overview, then use ## / ### headings for sections (e.g. Overview, Details, Acceptance Criteria), '-' or '*' bullet lists (indent two spaces for sub-items) for enumerations, numbered lists for ordered steps, Markdown tables for structured data, **bold** for key terms, and fenced ``` code blocks for code or payloads. Put a blank line between blocks. Keep it concise and scannable.";
-const COMMENT_FORMAT_GUIDE =
-  " Write one short conversational paragraph: start with @DisplayName of who to notify, say what changed (keep it high level for non-developers; include technical specifics like endpoints or payloads only when the reader is a developer and it makes sense), and end with the next step (e.g. 'Ready for verification.' or 'Please verify on TRAIN.'). Avoid bullet lists, headings, and bold unless the update genuinely needs them.";
+// Additive formatting guidance moved to SERVER_INSTRUCTIONS to reduce per-tool
+// token cost. Field descriptions retain their short base text only.
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   const rawTools = [
@@ -2064,7 +2081,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             instance: {
               type: "string",
-              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: [],
@@ -2092,7 +2109,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey"],
@@ -2118,7 +2135,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["jql"],
@@ -2127,7 +2144,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_add_comment",
         description:
-          "Add a comment to a Jira ticket. RULES: (1) Default to a HIGH LEVEL update for stakeholders, product owners, and QA, focus on WHAT changed and the impact, not how it was built (e.g. 'Implemented the new dashboard filtering' not 'added a debounced useEffect hook'). (2) Include technical detail ONLY when it makes sense for a developer reader, such as specifying endpoints, request payloads, or API contracts for another developer; otherwise leave out code, file paths, branch names, commit hashes, 'pushed to main', and framework-internal terms. (3) Use @DisplayName (e.g. @Julia Pereszta) for mentions, NOT [~accountId:...] syntax. (4) NEVER use em dashes (—) or en dashes (–), use commas, periods, or rewrite the sentence instead.",
+          "Add a comment to a Jira ticket. Follow the server instructions' comment style rules.",
         inputSchema: {
           type: "object",
           properties: {
@@ -2137,11 +2154,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             comment: {
               type: "string",
-              description: "The comment text to add." + COMMENT_FORMAT_GUIDE,
+              description: "The comment text to add.",
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey", "comment"],
@@ -2165,11 +2182,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             reply: {
               type: "string",
-              description: "The reply text." + COMMENT_FORMAT_GUIDE,
+              description: "The reply text.",
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey", "commentId", "reply"],
@@ -2178,7 +2195,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_edit_comment",
         description:
-          "Edit an existing comment on a Jira ticket. Replaces the comment text. Keep it high level for non-developers, and include technical detail (endpoints, payloads, API contracts) only when it makes sense for a developer reader. Use @DisplayName (e.g. @Julia Pereszta) for mentions, NOT [~accountId:...] syntax. NEVER use em dashes (—) or en dashes (–), use commas, periods, or rewrite the sentence instead.",
+          "Edit an existing comment on a Jira ticket (replaces the text). Follow the server instructions' comment style rules.",
         inputSchema: {
           type: "object",
           properties: {
@@ -2193,11 +2210,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             comment: {
               type: "string",
-              description: "The new comment text." + COMMENT_FORMAT_GUIDE,
+              description: "The new comment text.",
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey", "commentId", "comment"],
@@ -2221,7 +2238,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey", "commentId"],
@@ -2250,7 +2267,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey"],
@@ -2280,8 +2297,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: {
               type: "string",
               description:
-                "Text to add to the description. By default APPENDS to existing content. Set replaceDescription=true to replace instead." +
-                DESC_FORMAT_GUIDE,
+                "Text to add to the description. By default APPENDS to existing content. Set replaceDescription=true to replace instead.",
             },
             replaceDescription: {
               type: "boolean",
@@ -2312,7 +2328,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey"],
@@ -2336,7 +2352,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["query"],
@@ -2366,7 +2382,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name (for multi-instance setups with jql). Auto-detected from issueKey if provided.",
+              description: "Instance name (optional).",
             },
           },
           required: [],
@@ -2458,7 +2474,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name. Uses default instance if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: [],
@@ -2486,8 +2502,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: {
               type: "string",
               description:
-                "The issue description text. Supports @mentions via @DisplayName." +
-                DESC_FORMAT_GUIDE,
+                "The issue description text. Supports @mentions via @DisplayName.",
             },
             assignee: {
               type: "string",
@@ -2530,7 +2545,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from project key if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["projectKey", "issueType", "summary"],
@@ -2554,8 +2569,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: {
               type: "string",
               description:
-                "The subtask description text. Supports @mentions via @DisplayName." +
-                DESC_FORMAT_GUIDE,
+                "The subtask description text. Supports @mentions via @DisplayName.",
             },
             assignee: {
               type: "string",
@@ -2576,7 +2590,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from parent issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["parentKey", "summary"],
@@ -2607,7 +2621,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from inward issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["inwardIssueKey", "outwardIssueKey", "linkType"],
@@ -2630,7 +2644,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey"],
@@ -2661,7 +2675,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey"],
@@ -2676,7 +2690,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             instance: {
               type: "string",
-              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: [],
@@ -2695,7 +2709,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey"],
@@ -2718,7 +2732,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey", "linkedIssueKey"],
@@ -2745,7 +2759,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: [],
@@ -2768,7 +2782,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey", "accountId"],
@@ -2791,7 +2805,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey", "accountId"],
@@ -2822,7 +2836,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey", "timeSpent"],
@@ -2841,7 +2855,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey"],
@@ -2872,7 +2886,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from issue key prefix if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["issueKey"],
@@ -2896,7 +2910,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["sprintId", "issueKeys"],
@@ -2919,7 +2933,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["boardId"],
@@ -2946,7 +2960,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: [],
@@ -2965,7 +2979,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from project key if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["projectKey"],
@@ -2980,7 +2994,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             instance: {
               type: "string",
-              description: "Instance name (for multi-instance setups). Uses default instance if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: [],
@@ -2999,7 +3013,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from project key if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["projectKey"],
@@ -3018,7 +3032,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             instance: {
               type: "string",
-              description: "Instance name override. Auto-detected from project key if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: ["projectKey"],
@@ -3033,7 +3047,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             instance: {
               type: "string",
-              description: "Instance name. Uses default instance if omitted.",
+              description: "Instance name (optional).",
             },
           },
           required: [],
@@ -3047,7 +3061,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             spaceKey: { type: "string", description: "Space key (e.g., 'ENG')." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["spaceKey"],
         },
@@ -3062,7 +3076,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             spaceKey: { type: "string", description: "Unique space key (letters/numbers). Will be uppercased." },
             name: { type: "string", description: "Human-readable space name." },
             description: { type: "string", description: "Optional plain-text description." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["spaceKey", "name"],
         },
@@ -3077,7 +3091,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             spaceKey: { type: "string", description: "Space key to update." },
             name: { type: "string", description: "New space name." },
             description: { type: "string", description: "New plain-text description." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["spaceKey"],
         },
@@ -3090,7 +3104,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             spaceKey: { type: "string", description: "Space key to delete." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["spaceKey"],
         },
@@ -3106,7 +3120,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             spaceKey: { type: "string", description: "Optional space key to scope the search." },
             type: { type: "string", description: "Content type (default: page). e.g. page, blogpost, comment, attachment." },
             limit: { type: "number", description: "Max results (default: 25)." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["query"],
         },
@@ -3121,7 +3135,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             spaceKey: { type: "string", description: "Optional space key to scope the query." },
             sinceDays: { type: "number", description: "Days back from now (default: 30)." },
             limit: { type: "number", description: "Max results (default: 25)." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: [],
         },
@@ -3135,7 +3149,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             spaceKey: { type: "string", description: "Space key (required)." },
             limit: { type: "number", description: "Max results (default: 50)." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["spaceKey"],
         },
@@ -3149,7 +3163,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             pageId: { type: "string", description: "Parent page ID (required)." },
             limit: { type: "number", description: "Max results (default: 50)." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["pageId"],
         },
@@ -3163,7 +3177,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             pageId: { type: "string", description: "Page ID (required)." },
             includeAdf: { type: "boolean", description: "Fetch ADF body via v2 API and merge (default: true)." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["pageId"],
         },
@@ -3177,7 +3191,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             pageId: { type: "string", description: "Page ID (required)." },
             limit: { type: "number", description: "Max results (default: 50)." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["pageId"],
         },
@@ -3192,7 +3206,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             pageId: { type: "string", description: "Page ID (required)." },
             body: { type: "string", description: "Comment body (plain text by default, or storage XHTML if format=storage)." },
             format: { type: "string", description: "'text' (default) or 'storage'." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["pageId", "body"],
         },
@@ -3208,7 +3222,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             title: { type: "string", description: "New page title (optional — retains current if omitted)." },
             body: { type: "string", description: "New body as storage XHTML (optional — retains current if omitted)." },
             version: { type: "number", description: "Explicit new version number. If omitted, current+1 is computed." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["pageId"],
         },
@@ -3224,7 +3238,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             title: { type: "string", description: "Page title (required)." },
             body: { type: "string", description: "Storage-format XHTML body (required)." },
             parentId: { type: "string", description: "Optional parent page ID to nest under." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["spaceKey", "title", "body"],
         },
@@ -3236,7 +3250,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             pageId: { type: "string", description: "Page ID (required)." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["pageId"],
         },
@@ -3248,7 +3262,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             pageId: { type: "string", description: "Page ID (required)." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["pageId"],
         },
@@ -3261,7 +3275,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             pageId: { type: "string", description: "Page ID (required)." },
             label: { type: "string", description: "Label name (required)." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["pageId", "label"],
         },
@@ -3274,7 +3288,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             pageId: { type: "string", description: "Page ID (required)." },
             label: { type: "string", description: "Label name (required)." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["pageId", "label"],
         },
@@ -3287,7 +3301,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             pageId: { type: "string", description: "Page ID (required)." },
             limit: { type: "number", description: "Max results (default: 50)." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["pageId"],
         },
@@ -3304,7 +3318,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             fileContent: { type: "string", description: "Base64-encoded file content (requires fileName)." },
             fileName: { type: "string", description: "File name (required with fileContent; optional with filePath)." },
             comment: { type: "string", description: "Optional attachment comment." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["pageId"],
         },
@@ -3318,13 +3332,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             pageId: { type: "string", description: "Page ID (required)." },
             filename: { type: "string", description: "Attachment filename (required)." },
-            instance: { type: "string", description: "Instance name. Uses default instance if omitted." },
+            instance: { type: "string", description: "Instance name (optional)." },
           },
           required: ["pageId", "filename"],
         },
       },
     ];
-  return { tools: rawTools.map(_injectDryRunSchema) };
+  let tools = rawTools;
+  if (!confluenceActive) {
+    tools = rawTools.filter(t => !t.name.startsWith("confluence_"));
+    tools.push({
+      name: "confluence_enable",
+      description: "Activate the Confluence tool set (pages, spaces, page comments, labels, attachments, search). Call this first when a task needs Confluence; the confluence_* tools then become available. Activation only changes tool visibility for this server process; per-instance scopes still apply to every Confluence operation.",
+      inputSchema: { type: "object", properties: {}, required: [] },
+    });
+  }
+  return { tools: tools.map(_injectDryRunSchema) };
 });
 
 async function runWithPolicy(name, args, handler) {
@@ -3441,6 +3464,19 @@ async function runWithPolicy(name, args, handler) {
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  if (name === "confluence_enable") {
+    const wasActive = confluenceActive;
+    confluenceActive = true;
+    if (!wasActive) server.sendToolListChanged().catch((e) => console.error("jira-mcp: tools/list_changed notification failed:", e?.message || e));
+    return { content: [{ type: "text", text: wasActive ? "Confluence tools were already active." : "Confluence tools activated — the confluence_* tools are now available." }] };
+  }
+  // A client with a cached tool list may call a confluence_* tool directly
+  // while hidden — auto-activate instead of failing.
+  if (!confluenceActive && TOOL_METADATA[name]?.product === "confluence" && name !== "confluence_enable") {
+    confluenceActive = true;
+    server.sendToolListChanged().catch((e) => console.error("jira-mcp: tools/list_changed notification failed:", e?.message || e));
+  }
 
   return runWithPolicy(name, args, async () => {
     if (name === "jira_get_myself") {
