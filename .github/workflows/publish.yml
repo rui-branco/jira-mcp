@@ -62,7 +62,8 @@ jobs:
           unset OIDC_TOKEN
 
           # Validate response - fail-closed
-          if [ "$HTTP_CODE" != "200" ]; then
+          # npm returns 201 Created on successful token creation, 200 OK is also acceptable
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
             echo "::error::Token exchange failed with HTTP $HTTP_CODE"
             jq -r '.message // .error // "Unknown error"' "$RESP_FILE" 2>/dev/null || echo "Could not parse error response"
             exit 1
