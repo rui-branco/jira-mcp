@@ -802,6 +802,14 @@ function extractTextSimple(content) {
   return result.text;
 }
 
+// Prefix each line with "> " so echoed comments render as a markdown blockquote
+function quoteText(text) {
+  return text
+    .split("\n")
+    .map((line) => (line.trim() ? `> ${line}` : ">"))
+    .join("\n");
+}
+
 // ============ USER SEARCH & MENTIONS ============
 
 // Cache for user lookups to avoid repeated API calls
@@ -3599,11 +3607,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }, inst);
       const author = result.author?.displayName || "Unknown";
       const created = new Date(result.created).toLocaleString();
+      const postedText = quoteText(extractTextSimple(result.body).trim());
       return {
         content: [
           {
             type: "text",
-            text: `Comment added to ${args.issueKey} by ${author} at ${created}.`,
+            text: `Comment added to ${args.issueKey} by ${author} at ${created}:\n\n${postedText}`,
           },
         ],
       };
@@ -3667,11 +3676,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }, inst);
       const author = result.author?.displayName || "Unknown";
       const created = new Date(result.created).toLocaleString();
+      const postedText = quoteText(extractTextSimple(result.body).trim());
       return {
         content: [
           {
             type: "text",
-            text: `Reply to ${originalAuthor}'s comment posted on ${args.issueKey} by ${author} at ${created}.`,
+            text: `Reply to ${originalAuthor}'s comment posted on ${args.issueKey} by ${author} at ${created}:\n\n${postedText}`,
           },
         ],
       };
@@ -3691,11 +3701,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         { method: "PUT", body },
         inst,
       );
+      const editedText = quoteText(extractTextSimple(result.body).trim());
       return {
         content: [
           {
             type: "text",
-            text: `Comment ${args.commentId} on ${args.issueKey} updated.`,
+            text: `Comment ${args.commentId} on ${args.issueKey} updated:\n\n${editedText}`,
           },
         ],
       };
