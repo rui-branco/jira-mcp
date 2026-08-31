@@ -810,6 +810,10 @@ function quoteText(text) {
     .join("\n");
 }
 
+// Appended to comment-tool responses so the client relays the posted text to the user
+const ECHO_DIRECTIVE =
+  "IMPORTANT: In your reply to the user, reproduce the blockquoted comment above verbatim (keep the > blockquote) so they see exactly what was posted to Jira. Never reply with just 'comment posted' or a summary of it.";
+
 // ============ USER SEARCH & MENTIONS ============
 
 // Cache for user lookups to avoid repeated API calls
@@ -2043,6 +2047,8 @@ const SERVER_INSTRUCTIONS = `# jira-mcp usage rules
 ${confluenceMode !== "always" ? "- Confluence tools are hidden until activated: call `confluence_enable` first when a task needs Confluence (pages, spaces, page comments, labels, attachments).\n" : ""}
 ## Writing Jira comments (jira_add_comment / jira_reply_comment / jira_edit_comment)
 Write one short conversational paragraph: start with @DisplayName of who to notify (NOT [~accountId:...] syntax), say what changed, and end with the next step (e.g. 'Ready for verification.'). Keep it HIGH LEVEL for stakeholders/PO/QA — WHAT changed and the impact, not how it was built. Include technical detail (endpoints, payloads, API contracts) ONLY when the reader is a developer and it makes sense; otherwise leave out code, file paths, branch names, commit hashes, and framework-internal terms. NEVER use em dashes (—) or en dashes (–) — use commas, periods, or rewrite. Avoid bullet lists, headings, and bold unless the update genuinely needs them.
+Do NOT @mention automation/service accounts (e.g. 'Jira Integrations', bots): when the reporter or notify target is one, write the comment without any mention.
+After the tool succeeds, its response echoes the posted comment as a markdown blockquote. ALWAYS reproduce that blockquote verbatim in your final reply to the user so they see exactly what was posted to Jira — never reply with just 'comment added' or a paraphrase.
 
 ## Writing descriptions (jira_create_ticket / jira_update_ticket / jira_create_subtask)
 Structure with Markdown: a one/two-sentence overview, then ## / ### headings (Overview, Details, Acceptance Criteria), '-' bullet lists, numbered steps, tables for structured data, **bold** key terms, fenced \`\`\` blocks for code/payloads. Blank line between blocks. Concise and scannable. Never use em/en dashes.`;
@@ -3612,7 +3618,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: `Comment added to ${args.issueKey} by ${author} at ${created}:\n\n${postedText}`,
+            text: `Comment added to ${args.issueKey} by ${author} at ${created}:\n\n${postedText}\n\n${ECHO_DIRECTIVE}`,
           },
         ],
       };
@@ -3681,7 +3687,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: `Reply to ${originalAuthor}'s comment posted on ${args.issueKey} by ${author} at ${created}:\n\n${postedText}`,
+            text: `Reply to ${originalAuthor}'s comment posted on ${args.issueKey} by ${author} at ${created}:\n\n${postedText}\n\n${ECHO_DIRECTIVE}`,
           },
         ],
       };
@@ -3706,7 +3712,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: `Comment ${args.commentId} on ${args.issueKey} updated:\n\n${editedText}`,
+            text: `Comment ${args.commentId} on ${args.issueKey} updated:\n\n${editedText}\n\n${ECHO_DIRECTIVE}`,
           },
         ],
       };
