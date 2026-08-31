@@ -1,6 +1,6 @@
 {
   "name": "@rui.branco/jira-mcp",
-  "version": "1.7.8",
+  "version": "1.7.9",
   "description": "Jira & Confluence MCP server for any MCP-compatible AI client (Claude Code, Codex, Antigravity, Cursor, etc.) - fetch tickets, search with JQL, update tickets, manage comments, change status, get Figma designs. Optional per-tool scopes, dry-run, audit log, and rate limiting.",
   "main": "index.js",
   "bin": {
