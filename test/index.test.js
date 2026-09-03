@@ -1,5 +1,24 @@
-const { describe, it, beforeEach, mock } = require("node:test");
+const { describe, it, beforeEach, after, mock } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+const testHome = fs.mkdtempSync(path.join(os.tmpdir(), "jira-mcp-index-test-"));
+const testConfigPath = path.join(testHome, ".config", "jira-mcp", "config.json");
+fs.mkdirSync(path.dirname(testConfigPath), { recursive: true });
+fs.writeFileSync(testConfigPath, JSON.stringify({
+  email: "test@example.com",
+  token: "test-token",
+  baseUrl: "https://test.atlassian.net",
+  projects: ["MODS", "PROJ"],
+}));
+process.env.HOME = testHome;
+process.env.JIRA_MCP_CONFIG_PATH = testConfigPath;
+
+after(() => {
+  fs.rmSync(testHome, { recursive: true, force: true });
+});
 
 // Mock node-fetch before requiring index.js
 // This prevents the MCP server from making real HTTP calls

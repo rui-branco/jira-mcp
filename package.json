@@ -8,7 +8,8 @@
   },
   "files": [
     "index.js",
-    "setup.js"
+    "setup.js",
+    "config-store.js"
   ],
   "scripts": {
     "setup": "node setup.js",

@@ -17,6 +17,7 @@ const {
 const fs = require("fs");
 const path = require("path");
 const fetch = require("node-fetch");
+const configStore = require("./config-store.js");
 const { spawn, execSync } = require("child_process");
 
 // Auto-update: check GitHub for new commits, install in background
@@ -47,11 +48,7 @@ try {
 } catch {}
 
 // Load Jira config (supports single-instance and multi-instance formats)
-const jiraConfigPath = path.join(
-  process.env.HOME,
-  ".config/jira-mcp/config.json",
-);
-const rawConfig = JSON.parse(fs.readFileSync(jiraConfigPath, "utf8"));
+const rawConfig = configStore.loadConfigStrict();
 
 // Confluence tool visibility: 'on-demand' (default) hides the confluence_*
 // tools until confluence_enable is called; 'always' exposes them from boot.
@@ -62,47 +59,72 @@ if (confluenceMode !== "always" && confluenceMode !== "on-demand") {
 }
 let confluenceActive = confluenceMode === "always";
 
+function normalizeProjectPrefixes(projects) {
+  return [...new Set(
+    (Array.isArray(projects) ? projects : [])
+      .filter((project) => typeof project === "string")
+      .map((project) => project.trim().toUpperCase())
+      .filter(Boolean),
+  )];
+}
+
+function buildJiraInstance(inst) {
+  return {
+    ...inst,
+    projects: normalizeProjectPrefixes(inst.projects),
+    auth: Buffer.from(`${inst.email}:${inst.token}`).toString("base64"),
+  };
+}
+
 // Normalize config to multi-instance format
 let instances;
-if (rawConfig.instances) {
+if (Array.isArray(rawConfig.instances)) {
   // New multi-instance format
-  instances = rawConfig.instances.map((inst) => ({
-    ...inst,
-    projects: (inst.projects || []).map((p) => p.toUpperCase()),
-    auth: Buffer.from(`${inst.email}:${inst.token}`).toString("base64"),
-  }));
+  instances = rawConfig.instances.map(buildJiraInstance);
 } else {
   // Old single-instance format — wrap as array
-  instances = [
-    {
-      name: "default",
-      email: rawConfig.email,
-      token: rawConfig.token,
-      baseUrl: rawConfig.baseUrl,
-      projects: [],
-      auth: Buffer.from(`${rawConfig.email}:${rawConfig.token}`).toString("base64"),
-    },
-  ];
+  const legacyInstance = buildJiraInstance({
+    name: "default",
+    email: rawConfig.email,
+    token: rawConfig.token,
+    baseUrl: rawConfig.baseUrl,
+    projects: rawConfig.projects,
+  });
+  for (const field of ["scopes", "dryRun", "defaultTeam", "projectTeams", "confluenceBaseUrl"]) {
+    if (rawConfig[field] !== undefined) legacyInstance[field] = rawConfig[field];
+  }
+  instances = [legacyInstance];
 }
 
 // Resolve default instance
-const defaultInstance =
+let defaultInstance =
   (rawConfig.defaultInstance && instances.find((i) => i.name === rawConfig.defaultInstance)) ||
   instances[0];
 
-// Re-read config file (for persisting changes)
-function loadConfigFile() {
-  try {
-    return JSON.parse(fs.readFileSync(jiraConfigPath, "utf8"));
-  } catch {
-    return {};
-  }
+// Instance resolution helpers
+function getMappedInstancesForProject(projectPrefix) {
+  if (typeof projectPrefix !== "string") return [];
+  const upper = projectPrefix.trim().toUpperCase();
+  return instances.filter((i) => i.projects.includes(upper));
 }
 
-// Instance resolution helpers
+function getProjectAmbiguityError(projectPrefix, owners) {
+  const upper = projectPrefix.trim().toUpperCase();
+  const names = owners.map((owner) => `"${owner.name}"`).join(", ");
+  return new Error(
+    `Project prefix "${upper}" is mapped to multiple Jira instances (${names}). Pass an explicit instance.`,
+  );
+}
+
+function getMappedInstanceForProject(projectPrefix) {
+  const owners = getMappedInstancesForProject(projectPrefix);
+  return owners.length === 1 ? owners[0] : undefined;
+}
+
 function getInstanceForProject(projectPrefix) {
-  const upper = projectPrefix.toUpperCase();
-  return instances.find((i) => i.projects.includes(upper)) || defaultInstance;
+  const owners = getMappedInstancesForProject(projectPrefix);
+  if (owners.length > 1) throw getProjectAmbiguityError(projectPrefix, owners);
+  return owners[0] || defaultInstance;
 }
 
 function getInstanceForKey(issueKey) {
@@ -112,7 +134,9 @@ function getInstanceForKey(issueKey) {
 
 function getInstanceByName(name) {
   if (!name) return defaultInstance;
-  return instances.find((i) => i.name === name) || defaultInstance;
+  const instance = instances.find((i) => i.name === name);
+  if (!instance) throw new Error(`Instance "${name}" not found.`);
+  return instance;
 }
 
 // Load Figma config (optional)
@@ -433,24 +457,285 @@ function extractTarget(args) {
   );
 }
 
+const ROUTING_ISSUE_FIELDS = [
+  "issueKey",
+  "parentKey",
+  "inwardIssueKey",
+  "outwardIssueKey",
+  "linkedIssueKey",
+];
+
+function isProjectPrefix(value) {
+  return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_]*$/.test(value);
+}
+
+function issueKeyToProjectPrefix(value) {
+  if (typeof value !== "string") return null;
+  const match = value.trim().match(/^([A-Za-z][A-Za-z0-9_]*)-/);
+  return match ? match[1].toUpperCase() : null;
+}
+
+function projectValueToPrefix(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || /^\d+$/.test(trimmed) || !isProjectPrefix(trimmed)) return null;
+  return trimmed.toUpperCase();
+}
+
+function extractRoutingPrefixes(toolName, args) {
+  if (
+    !args ||
+    typeof args !== "object" ||
+    TOOL_METADATA[toolName]?.product !== "jira" ||
+    toolName === "jira_add_instance"
+  ) {
+    return [];
+  }
+
+  const prefixes = [];
+  const add = (prefix) => {
+    if (prefix && !prefixes.includes(prefix)) prefixes.push(prefix);
+  };
+
+  for (const field of ROUTING_ISSUE_FIELDS) {
+    add(issueKeyToProjectPrefix(args[field]));
+  }
+  if (Array.isArray(args.issueKeys)) {
+    for (const issueKey of args.issueKeys) {
+      add(issueKeyToProjectPrefix(issueKey));
+    }
+  }
+  add(projectValueToPrefix(args.projectKey));
+  add(projectValueToPrefix(args.projectKeyOrId));
+  add(projectValueToPrefix(args.targetProjectKey));
+  return prefixes;
+}
+
+async function probeJiraProject(prefix, instance) {
+  let response;
+  try {
+    response = await fetch(
+      `${instance.baseUrl}/rest/api/3/project/${encodeURIComponent(prefix)}`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Basic ${instance.auth}`,
+          Accept: "application/json",
+        },
+      },
+    );
+  } catch (error) {
+    throw new Error(
+      `Project discovery failed for prefix "${prefix}" on instance "${instance.name}": ${error.message}`,
+    );
+  }
+
+  if (!response || typeof response !== "object") {
+    throw new Error(
+      `Project discovery failed for prefix "${prefix}" on instance "${instance.name}": malformed response.`,
+    );
+  }
+  const status = response.status == null && response.ok ? 200 : response.status;
+  if (status === 200) {
+    if (typeof response.text !== "function") {
+      throw new Error(
+        `Project discovery failed for prefix "${prefix}" on instance "${instance.name}": malformed response.`,
+      );
+    }
+    let text;
+    try {
+      text = await response.text();
+    } catch {
+      throw new Error(
+        `Project discovery failed for prefix "${prefix}" on instance "${instance.name}": malformed response.`,
+      );
+    }
+    let project;
+    try {
+      project = JSON.parse(text);
+    } catch {
+      throw new Error(
+        `Project discovery failed for prefix "${prefix}" on instance "${instance.name}": malformed response.`,
+      );
+    }
+    if (!project || typeof project !== "object" || Array.isArray(project)) {
+      throw new Error(
+        `Project discovery failed for prefix "${prefix}" on instance "${instance.name}": malformed response.`,
+      );
+    }
+    return { kind: "match" };
+  }
+  if (status === 404) return { kind: "missing" };
+  if (status === 401 || status === 403) {
+    return { kind: "inaccessible", status };
+  }
+  if (typeof status === "number" && status >= 500) {
+    throw new Error(
+      `Project discovery failed for prefix "${prefix}" on instance "${instance.name}": Jira returned HTTP ${status}.`,
+    );
+  }
+  throw new Error(
+    `Project discovery failed for prefix "${prefix}" on instance "${instance.name}": unexpected HTTP status ${status}.`,
+  );
+}
+
+async function discoverProjectInstance(prefix) {
+  const results = await Promise.all(
+    instances.map(async (instance) => ({
+      instance,
+      result: await probeJiraProject(prefix, instance),
+    })),
+  );
+  const inaccessible = results.filter(({ result }) => result.kind === "inaccessible");
+  if (inaccessible.length > 0) {
+    const details = inaccessible
+      .map(({ instance, result }) => `"${instance.name}" (HTTP ${result.status})`)
+      .join(", ");
+    throw new Error(
+      `Project prefix "${prefix}" was not found on any accessible Jira instance. Permission denied on ${details}.`,
+    );
+  }
+
+  const matches = results.filter(({ result }) => result.kind === "match");
+  if (matches.length === 1) return matches[0].instance;
+  if (matches.length > 1) {
+    const names = matches.map(({ instance }) => `"${instance.name}"`).join(", ");
+    throw new Error(
+      `Project prefix "${prefix}" is accessible on multiple Jira instances (${names}). Pass an explicit instance.`,
+    );
+  }
+  throw new Error(`Project prefix "${prefix}" was not found on any configured Jira instance.`);
+}
+
+async function validateProjectOnInstance(prefix, instance) {
+  const result = await probeJiraProject(prefix, instance);
+  if (result.kind === "match") return;
+  if (result.kind === "inaccessible") {
+    throw new Error(
+      `Cannot access project prefix "${prefix}" on explicitly selected Jira instance "${instance.name}" (HTTP ${result.status}).`,
+    );
+  }
+  throw new Error(
+    `Project prefix "${prefix}" was not found on explicitly selected Jira instance "${instance.name}".`,
+  );
+}
+
+function addProjectsToConfig(config, instanceName, prefixes) {
+  const normalized = normalizeProjectPrefixes(prefixes);
+  if (Array.isArray(config.instances)) {
+    const savedInstance = config.instances.find((instance) => instance.name === instanceName);
+    if (!savedInstance) {
+      throw new Error(`Instance "${instanceName}" no longer exists in the Jira config.`);
+    }
+    for (const prefix of normalized) {
+      const otherOwners = config.instances.filter(
+        (instance) =>
+          instance.name !== instanceName &&
+          normalizeProjectPrefixes(instance.projects).includes(prefix),
+      );
+      if (otherOwners.length > 0) {
+        throw new Error(
+          `Project prefix "${prefix}" is already mapped to Jira instance(s) ${otherOwners.map((owner) => `"${owner.name}"`).join(", ")}.`,
+        );
+      }
+    }
+    savedInstance.projects = normalizeProjectPrefixes([
+      ...(savedInstance.projects || []),
+      ...normalized,
+    ]);
+    return savedInstance.projects;
+  }
+  if (config.instances !== undefined) {
+    throw new Error("Jira config has an invalid instances value.");
+  }
+  if (instanceName !== "default") {
+    throw new Error(`Instance "${instanceName}" no longer exists in the Jira config.`);
+  }
+  config.projects = normalizeProjectPrefixes([
+    ...(config.projects || []),
+    ...normalized,
+  ]);
+  return config.projects;
+}
+
+let discoveryWriteQueue = Promise.resolve();
+
+function persistDiscoveredProjects(instance, prefixes) {
+  const normalized = normalizeProjectPrefixes(prefixes);
+  if (normalized.length === 0) return Promise.resolve(instance);
+
+  const operation = discoveryWriteQueue.then(() => {
+    const currentInstance = instances.find((candidate) => candidate.name === instance.name);
+    if (!currentInstance) {
+      throw new Error(`Instance "${instance.name}" no longer exists in memory.`);
+    }
+    const savedProjects = configStore.updateConfigSync((savedConfig) =>
+      addProjectsToConfig(savedConfig, instance.name, normalized),
+    );
+    // The in-memory route changes only after the atomic replacement succeeds.
+    currentInstance.projects = normalizeProjectPrefixes(savedProjects);
+    return currentInstance;
+  });
+  discoveryWriteQueue = operation.catch(() => {});
+  return operation;
+}
+
+function assertSameInstance(entries) {
+  const names = [...new Set(entries.map(({ instance }) => instance.name))];
+  if (names.length > 1) {
+    throw new Error(
+      `Jira targets resolve to different instances (${names.join(", ")}). Use an explicit instance and keep all keys on the same Jira instance.`,
+    );
+  }
+}
+
 // Resolve instance for policy purposes (must run BEFORE the dispatch handler).
-// Routing keys vary by tool — issueKey is most common but subtask uses
-// parentKey, link uses inwardIssueKey, create_ticket uses projectKey, and
-// Confluence tools route by spaceKey. If a tool genuinely targets a specific
-// instance via no key (e.g. jira_get_boards), it falls back to the default
-// instance — the user can still override with args.instance.
-function resolveInstanceForTool(toolName, args) {
-  if (!args) return defaultInstance;
-  if (args.instance) return getInstanceByName(args.instance);
-  const keyLike =
-    args.issueKey ||
-    args.parentKey ||
-    args.inwardIssueKey ||
-    args.outwardIssueKey;
-  if (keyLike) return getInstanceForKey(keyLike);
-  const projectLike = args.projectKey || args.spaceKey;
-  if (projectLike) return getInstanceForProject(projectLike);
-  return defaultInstance;
+// Discovery happens here so scope, dry-run, rate-limit, audit, and the handler
+// all use the same target instance.
+async function resolveInstanceForTool(toolName, args) {
+  const explicit = args && args.instance ? getInstanceByName(args.instance) : null;
+  const prefixes = extractRoutingPrefixes(toolName, args);
+  if (prefixes.length === 0) return explicit || defaultInstance;
+
+  if (explicit) {
+    const unknown = prefixes.filter(
+      (prefix) => getMappedInstancesForProject(prefix).length === 0,
+    );
+    if (unknown.length > 0) {
+      await Promise.all(unknown.map((prefix) => validateProjectOnInstance(prefix, explicit)));
+      await persistDiscoveredProjects(explicit, unknown);
+    }
+    return explicit;
+  }
+
+  const known = [];
+  const unknown = [];
+  for (const prefix of prefixes) {
+    const owners = getMappedInstancesForProject(prefix);
+    if (owners.length === 0) {
+      unknown.push(prefix);
+    } else if (owners.length > 1) {
+      throw getProjectAmbiguityError(prefix, owners);
+    } else {
+      known.push({ prefix, instance: owners[0] });
+    }
+  }
+  assertSameInstance(known);
+  if (unknown.length === 0) return known[0]?.instance || defaultInstance;
+
+  const discovered = await Promise.all(
+    unknown.map(async (prefix) => ({
+      prefix,
+      instance: await discoverProjectInstance(prefix),
+    })),
+  );
+  assertSameInstance([
+    ...known,
+    ...discovered,
+  ]);
+  const selected = known[0]?.instance || discovered[0].instance;
+  await persistDiscoveredProjects(selected, unknown);
+  return selected;
 }
 
 // ============ JIRA FUNCTIONS ============
@@ -3379,7 +3664,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 async function runWithPolicy(name, args, handler) {
   const meta = TOOL_METADATA[name];
-  const inst = resolveInstanceForTool(name, args);
+  let inst;
+  try {
+    inst = await resolveInstanceForTool(name, args);
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: `Error: ${error.message}` }],
+      isError: true,
+    };
+  }
 
   // 1. Scope check
   const scopeResult = checkScope(name, inst);
@@ -3518,7 +3811,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_search_users") {
-      const inst = resolveInstanceForTool(name, args);
+      const inst = await resolveInstanceForTool(name, args);
       const maxResults = args.maxResults || 5;
       const hasAssignmentContext = Boolean(args.issueKey || args.projectKey);
       let users;
@@ -3985,7 +4278,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
       if (args.issueKey) {
-        const result = await getChangelog(args.issueKey);
+        const inst = args.instance
+          ? getInstanceByName(args.instance)
+          : getInstanceForKey(args.issueKey);
+        const result = await getChangelog(args.issueKey, inst);
         return { content: [{ type: "text", text: result.formatted }] };
       } else {
         const inst = getInstanceByName(args.instance);
@@ -3995,6 +4291,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } else if (name === "jira_add_instance") {
       const instName = args.name.trim();
       const existingIdx = instances.findIndex((i) => i.name === instName);
+      const existing = existingIdx >= 0 ? instances[existingIdx] : {};
       const isUpdate = existingIdx >= 0;
 
       // For new instances, email/token/baseUrl are required
@@ -4005,27 +4302,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      // Merge with existing or create new
-      const existing = isUpdate ? instances[existingIdx] : {};
       const email = args.email || existing.email;
       const token = args.token || existing.token;
       const baseUrl = args.baseUrl ? args.baseUrl.replace(/\/$/, "") : existing.baseUrl;
-      const projects = args.projects ? args.projects.map((p) => p.toUpperCase()) : (existing.projects || []);
+      const requestedProjects = Array.isArray(args.projects)
+        ? normalizeProjectPrefixes(args.projects)
+        : null;
+      const currentProjects = normalizeProjectPrefixes(existing.projects);
       const authStr = Buffer.from(`${email}:${token}`).toString("base64");
 
       // Resolve defaultTeam if provided
-      let defaultTeam = existing.defaultTeam || undefined;
+      let defaultTeamChange = null;
       if (args.defaultTeam !== undefined) {
         if (args.defaultTeam === "") {
-          defaultTeam = undefined;
+          defaultTeamChange = { value: undefined };
         } else if (args.defaultTeam.toLowerCase() === "none") {
-          defaultTeam = "none";
+          defaultTeamChange = { value: "none" };
         } else {
           // Validate team exists via Jira Teams API
           const tempInst = { baseUrl, auth: authStr };
           try {
             const teamId = await resolveTeamId(args.defaultTeam, tempInst);
-            defaultTeam = { name: args.defaultTeam, id: teamId };
+            defaultTeamChange = { value: { name: args.defaultTeam, id: teamId } };
           } catch (e) {
             // Try to list available teams for a helpful error
             try {
@@ -4046,18 +4344,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       // Resolve projectTeam if provided
-      let projectTeams = existing.projectTeams || {};
+      let projectTeamChange = null;
       if (args.projectKey && args.projectTeam !== undefined) {
         const pk = args.projectKey.toUpperCase();
         if (args.projectTeam === "") {
-          delete projectTeams[pk];
+          projectTeamChange = { key: pk, value: undefined };
         } else if (args.projectTeam.toLowerCase() === "none") {
-          projectTeams[pk] = "none";
+          projectTeamChange = { key: pk, value: "none" };
         } else {
           const tempInst = { baseUrl, auth: authStr };
           try {
             const teamId = await resolveTeamId(args.projectTeam, tempInst);
-            projectTeams[pk] = { name: args.projectTeam, id: teamId };
+            projectTeamChange = {
+              key: pk,
+              value: { name: args.projectTeam, id: teamId },
+            };
           } catch (e) {
             return {
               content: [{ type: "text", text: e.message }],
@@ -4067,76 +4368,106 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      const newInstance = { name: instName, email, token, baseUrl, projects, auth: authStr, defaultTeam, projectTeams };
-
-      // Update in-memory instances
-      if (isUpdate) {
-        instances[existingIdx] = newInstance;
-      } else {
-        instances.push(newInstance);
-      }
-
-      // Persist to config file
-      const savedConfig = loadConfigFile();
-      if (!savedConfig.instances) {
-        // Migrate old format
-        if (savedConfig.email) {
-          savedConfig.instances = [{
-            name: "default",
-            email: savedConfig.email,
-            token: savedConfig.token,
-            baseUrl: savedConfig.baseUrl,
-            projects: [],
-          }];
-          savedConfig.defaultInstance = "default";
-          delete savedConfig.email;
-          delete savedConfig.token;
-          delete savedConfig.baseUrl;
-        } else {
-          savedConfig.instances = [];
+      const persisted = configStore.updateConfigSync((savedConfig) => {
+        configStore.migrateLegacyConfig(savedConfig);
+        const savedIdx = savedConfig.instances.findIndex((i) => i.name === instName);
+        const prevSaved = savedIdx >= 0 ? savedConfig.instances[savedIdx] : {};
+        const savedEmail = args.email || prevSaved.email || email;
+        const savedToken = args.token || prevSaved.token || token;
+        const savedBaseUrl = args.baseUrl
+          ? args.baseUrl.replace(/\/$/, "")
+          : (prevSaved.baseUrl || baseUrl);
+        if (!savedEmail || !savedToken || !savedBaseUrl) {
+          throw new Error("New instance requires email, token, and baseUrl.");
         }
-      }
 
-      // Save without the computed auth field. Preserve any safety/observability
-      // fields the user has configured on the existing instance (scopes, dryRun,
-      // confluenceBaseUrl) so they survive a re-run of jira_add_instance.
-      const savedIdx = savedConfig.instances.findIndex((i) => i.name === instName);
-      const prevSaved = savedIdx >= 0 ? savedConfig.instances[savedIdx] : {};
-      const toSave = {
-        ...prevSaved,
-        name: instName,
-        email,
-        token,
-        baseUrl,
-        projects,
-      };
-      if (defaultTeam) toSave.defaultTeam = defaultTeam;
-      if (Object.keys(projectTeams).length > 0) toSave.projectTeams = projectTeams;
-      if (savedIdx >= 0) {
-        savedConfig.instances[savedIdx] = toSave;
+        const latestProjects = normalizeProjectPrefixes(prevSaved.projects);
+        const projects = requestedProjects === null
+          ? latestProjects
+          : normalizeProjectPrefixes([
+            ...requestedProjects,
+            ...latestProjects.filter((project) => !currentProjects.includes(project)),
+          ]);
+        configStore.assertNoDuplicateProjectOwnership(savedConfig, instName, projects);
+
+        const toSave = {
+          ...prevSaved,
+          name: instName,
+          email: savedEmail,
+          token: savedToken,
+          baseUrl: savedBaseUrl,
+          projects,
+        };
+        if (defaultTeamChange) {
+          if (defaultTeamChange.value === undefined) {
+            delete toSave.defaultTeam;
+          } else {
+            toSave.defaultTeam = defaultTeamChange.value;
+          }
+        }
+        const projectTeams = { ...(prevSaved.projectTeams || {}) };
+        if (projectTeamChange) {
+          if (projectTeamChange.value === undefined) {
+            delete projectTeams[projectTeamChange.key];
+          } else {
+            projectTeams[projectTeamChange.key] = projectTeamChange.value;
+          }
+        }
+        if (Object.keys(projectTeams).length > 0) {
+          toSave.projectTeams = projectTeams;
+        } else {
+          delete toSave.projectTeams;
+        }
+        if (savedIdx >= 0) {
+          savedConfig.instances[savedIdx] = toSave;
+        } else {
+          savedConfig.instances.push(toSave);
+        }
+        if (args.setDefault || !savedConfig.defaultInstance) {
+          savedConfig.defaultInstance = instName;
+        }
+        return {
+          instance: toSave,
+          isUpdate: savedIdx >= 0,
+          defaultInstance: savedConfig.defaultInstance,
+        };
+      });
+
+      // Update in-memory state only after the atomic config replacement succeeds.
+      const savedInstance = buildJiraInstance(persisted.instance);
+      const currentIdx = instances.findIndex((i) => i.name === instName);
+      let activeInstance;
+      if (currentIdx >= 0) {
+        activeInstance = instances[currentIdx];
+        for (const key of Object.keys(activeInstance)) delete activeInstance[key];
+        Object.assign(activeInstance, savedInstance);
       } else {
-        savedConfig.instances.push(toSave);
+        instances.push(savedInstance);
+        activeInstance = savedInstance;
       }
-      if (args.setDefault || !savedConfig.defaultInstance) {
-        savedConfig.defaultInstance = instName;
-      }
-      fs.writeFileSync(jiraConfigPath, JSON.stringify(savedConfig, null, 2));
+      defaultInstance =
+        instances.find((instance) => instance.name === persisted.defaultInstance) ||
+        instances[0];
+      rawConfig.defaultInstance = persisted.defaultInstance;
 
-      const action = isUpdate ? "Updated" : "Added";
-      let text = `${action} instance "${instName}" (${baseUrl}).`;
-      if (projects.length > 0) text += ` Projects: ${projects.join(", ")}.`;
+      const action = persisted.isUpdate ? "Updated" : "Added";
+      const savedBaseUrl = activeInstance.baseUrl;
+      const savedProjects = activeInstance.projects;
+      const projectTeams = activeInstance.projectTeams || {};
+      let text = `${action} instance "${instName}" (${savedBaseUrl}).`;
+      if (savedProjects.length > 0) text += ` Projects: ${savedProjects.join(", ")}.`;
       if (args.setDefault) text += " Set as default.";
-      if (args.projectKey && args.projectTeam !== undefined) {
-        const pk = args.projectKey.toUpperCase();
-        const pt = projectTeams[pk];
+      if (projectTeamChange) {
+        const pt = projectTeams[projectTeamChange.key];
         if (pt === "none") {
-          text += ` Project ${pk} team: None (disabled).`;
+          text += ` Project ${projectTeamChange.key} team: None (disabled).`;
         } else if (pt) {
-          text += ` Project ${pk} team: ${pt.name}.`;
+          text += ` Project ${projectTeamChange.key} team: ${pt.name}.`;
         } else {
-          text += ` Project ${pk} team override removed.`;
+          text += ` Project ${projectTeamChange.key} team override removed.`;
         }
       }
+      const defaultTeam = activeInstance.defaultTeam;
       if (defaultTeam === "none") {
         text += " Default team: None (disabled).";
       } else if (defaultTeam) {
@@ -4144,8 +4475,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       } else {
         // No default team — fetch available teams and prompt
         try {
-          const tempInst = { baseUrl, auth: authStr };
-          const teams = await listTeams(tempInst);
+          const teams = await listTeams(activeInstance);
           if (teams && teams.length > 0) {
             const list = teams.map((t, i) => `${i + 1}. ${t.title}`).join("\n");
             text += `\n\n⚠ No default team configured. Available teams:\n0. None\n${list}\n\nIMPORTANT: You MUST display this full numbered list in your chat response so the user can see and choose. NEVER auto-select a team. Ask the user to pick a number, type a team name to search, or choose None.\nIf they pick one, call jira_add_instance with name="${instName}" and defaultTeam="<team name>".\nIf the team is not listed, the user can type a name and you search with jira_add_instance defaultTeam="<name>" (it validates automatically).\nIf "None" is selected, call jira_add_instance with defaultTeam="none" to stop future prompts.`;
@@ -4159,33 +4489,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     } else if (name === "jira_remove_instance") {
       const instName = args.name.trim();
-
-      if (instances.length <= 1) {
+      let removal;
+      try {
+        removal = configStore.updateConfigSync((savedConfig) => {
+          if (!Array.isArray(savedConfig.instances)) {
+            throw new Error(`Instance "${instName}" not found.`);
+          }
+          if (savedConfig.instances.length <= 1) {
+            throw new Error("Cannot remove the last remaining instance.");
+          }
+          const idx = savedConfig.instances.findIndex((i) => i.name === instName);
+          if (idx < 0) {
+            throw new Error(`Instance "${instName}" not found.`);
+          }
+          savedConfig.instances.splice(idx, 1);
+          if (savedConfig.defaultInstance === instName) {
+            savedConfig.defaultInstance = savedConfig.instances[0]?.name || null;
+          }
+          return { defaultInstance: savedConfig.defaultInstance };
+        });
+      } catch (error) {
         return {
-          content: [{ type: "text", text: "Cannot remove the last remaining instance." }],
+          content: [{ type: "text", text: error.message }],
           isError: true,
         };
       }
 
+      // Update in-memory state only after the atomic config replacement succeeds.
       const idx = instances.findIndex((i) => i.name === instName);
-      if (idx < 0) {
-        return {
-          content: [{ type: "text", text: `Instance "${instName}" not found.` }],
-          isError: true,
-        };
-      }
-
-      instances.splice(idx, 1);
-
-      // Persist to config file
-      const savedConfig = loadConfigFile();
-      if (savedConfig.instances) {
-        savedConfig.instances = savedConfig.instances.filter((i) => i.name !== instName);
-        if (savedConfig.defaultInstance === instName) {
-          savedConfig.defaultInstance = savedConfig.instances[0]?.name || null;
-        }
-        fs.writeFileSync(jiraConfigPath, JSON.stringify(savedConfig, null, 2));
-      }
+      if (idx >= 0) instances.splice(idx, 1);
+      defaultInstance =
+        instances.find((instance) => instance.name === removal.defaultInstance) ||
+        instances[0];
+      rawConfig.defaultInstance = removal.defaultInstance;
 
       return { content: [{ type: "text", text: `Removed instance "${instName}".` }] };
 
@@ -4758,7 +5094,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
 
     } else if (name === "jira_move_to_sprint") {
-      const inst = getInstanceByName(args.instance);
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : (args.issueKeys?.length ? getInstanceForKey(args.issueKeys[0]) : defaultInstance);
       await fetchJiraAgile(
         `/sprint/${args.sprintId}/issue`,
         { method: "POST", body: { issues: args.issueKeys } },
@@ -4793,7 +5131,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text }] };
 
     } else if (name === "jira_get_boards") {
-      const inst = getInstanceByName(args.instance);
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : (projectValueToPrefix(args.projectKeyOrId)
+          ? getInstanceForProject(args.projectKeyOrId)
+          : defaultInstance);
       let endpoint = "/board?maxResults=50";
       if (args.projectKeyOrId) {
         endpoint += `&projectKeyOrId=${encodeURIComponent(args.projectKeyOrId)}`;
@@ -5414,7 +5756,8 @@ if (typeof module !== "undefined") {
     // Policy module exports
     TOOL_METADATA, checkScope, resolveDryRun, scrubArgs, extractTarget,
     checkRateLimit, _setClockForTests, _resetBucketsForTests,
-    resolveInstanceForTool, _injectDryRunSchema,
+    extractRoutingPrefixes, probeJiraProject, discoverProjectInstance,
+    persistDiscoveredProjects, resolveInstanceForTool, _injectDryRunSchema,
     AUDIT_LOG_PATH,
   };
 }

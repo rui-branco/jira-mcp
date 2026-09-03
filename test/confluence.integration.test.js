@@ -1,5 +1,12 @@
-const { describe, it, before } = require("node:test");
+const { describe, it, before, after } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+const testHome = fs.mkdtempSync(path.join(os.tmpdir(), "jira-mcp-confluence-test-"));
+const testConfigPath = path.join(testHome, ".config", "jira-mcp", "config.json");
+fs.mkdirSync(path.dirname(testConfigPath), { recursive: true });
 
 // Integration tests for the Confluence tools. These hit a real Atlassian
 // Cloud instance and are skipped when credentials are not provided via env
@@ -22,6 +29,13 @@ const testPageId = process.env.CONFLUENCE_TEST_PAGE_ID;
 const testSpaceKey = process.env.CONFLUENCE_TEST_SPACE_KEY;
 
 const envReady = email && token && baseUrl;
+fs.writeFileSync(testConfigPath, JSON.stringify({ email, token, baseUrl }));
+process.env.HOME = testHome;
+process.env.JIRA_MCP_CONFIG_PATH = testConfigPath;
+
+after(() => {
+  fs.rmSync(testHome, { recursive: true, force: true });
+});
 
 // index.js has module-level side effects (reads the Jira config file, kicks
 // off an auto-update check). For integration runs we only need the exported

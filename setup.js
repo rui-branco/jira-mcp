@@ -3,9 +3,9 @@
 const readline = require("readline");
 const fs = require("fs");
 const path = require("path");
+const configStore = require("./config-store.js");
 
-const configDir = path.join(process.env.HOME, ".config/jira-mcp");
-const configPath = path.join(configDir, "config.json");
+const configPath = configStore.configPath;
 
 // Check for command line arguments
 let args = process.argv.slice(2);
@@ -14,62 +14,55 @@ if (args[0] === "setup") args = args.slice(1);
 
 // Load existing config if present
 function loadConfig() {
-  try {
-    if (fs.existsSync(configPath)) {
-      return JSON.parse(fs.readFileSync(configPath, "utf8"));
-    }
-  } catch {}
-  return null;
+  return configStore.loadConfig();
 }
 
-function saveConfig(config) {
-  if (!fs.existsSync(configDir)) {
-    fs.mkdirSync(configDir, { recursive: true });
-  }
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+function saveConfig(mutator) {
+  return configStore.updateConfigSync(mutator);
 }
 
 // Non-interactive: setup add <name> <email> <token> <baseUrl> <projects>
 if (args[0] === "add" && args.length >= 5) {
   const [, name, email, token, baseUrl, ...projectArgs] = args;
   const projects = projectArgs.length > 0
-    ? projectArgs.join(",").split(",").map((p) => p.trim().toUpperCase()).filter(Boolean)
+    ? configStore.normalizeProjects(projectArgs.join(",").split(","))
     : [];
 
-  const config = loadConfig() || {};
-
-  // Migrate old format if needed
-  if (config.email && !config.instances) {
-    config.instances = [{
-      name: "default",
-      email: config.email,
-      token: config.token,
-      baseUrl: config.baseUrl,
-      projects: [],
-    }];
-    config.defaultInstance = "default";
-    delete config.email;
-    delete config.token;
-    delete config.baseUrl;
+  let saved;
+  try {
+    saved = saveConfig((config) => {
+      configStore.migrateLegacyConfig(config);
+      const existingIdx = config.instances.findIndex((instance) => instance.name === name);
+      const previous = existingIdx >= 0 ? config.instances[existingIdx] : {};
+      const mergedProjects = configStore.normalizeProjects([
+        ...(previous.projects || []),
+        ...projects,
+      ]);
+      configStore.assertNoDuplicateProjectOwnership(config, name, mergedProjects);
+      const instance = {
+        ...previous,
+        name,
+        email,
+        token,
+        baseUrl: baseUrl.replace(/\/$/, ""),
+        projects: mergedProjects,
+      };
+      if (existingIdx >= 0) {
+        config.instances[existingIdx] = instance;
+      } else {
+        config.instances.push(instance);
+      }
+      if (!config.defaultInstance) config.defaultInstance = name;
+      return { instance };
+    });
+  } catch (error) {
+    console.error("Setup failed:", error.message);
+    process.exit(1);
   }
 
-  if (!config.instances) config.instances = [];
-
-  // Replace or add instance
-  const existing = config.instances.findIndex((i) => i.name === name);
-  const instance = { name, email, token, baseUrl: baseUrl.replace(/\/$/, ""), projects };
-  if (existing >= 0) {
-    config.instances[existing] = instance;
-  } else {
-    config.instances.push(instance);
-  }
-
-  if (!config.defaultInstance) config.defaultInstance = name;
-
-  saveConfig(config);
   console.log(`Instance "${name}" saved to ${configPath}`);
-  if (projects.length > 0) {
-    console.log(`Projects: ${projects.join(", ")}`);
+  if (saved.instance.projects.length > 0) {
+    console.log(`Projects: ${saved.instance.projects.join(", ")}`);
   }
   process.exit(0);
 }
@@ -77,19 +70,23 @@ if (args[0] === "add" && args.length >= 5) {
 // Non-interactive: setup remove <name>
 if (args[0] === "remove" && args.length >= 2) {
   const name = args[1];
-  const config = loadConfig();
-
-  if (!config || !config.instances) {
-    console.error("No multi-instance config found.");
+  let removed;
+  try {
+    removed = saveConfig((config) => {
+      if (!Array.isArray(config.instances)) {
+        throw new Error("No multi-instance config found.");
+      }
+      config.instances = config.instances.filter((instance) => instance.name !== name);
+      if (config.defaultInstance === name) {
+        config.defaultInstance = config.instances[0]?.name || null;
+      }
+      return { defaultInstance: config.defaultInstance };
+    });
+  } catch (error) {
+    console.error(error.message);
     process.exit(1);
   }
 
-  config.instances = config.instances.filter((i) => i.name !== name);
-  if (config.defaultInstance === name) {
-    config.defaultInstance = config.instances[0]?.name || null;
-  }
-
-  saveConfig(config);
   console.log(`Instance "${name}" removed.`);
   process.exit(0);
 }
@@ -97,7 +94,30 @@ if (args[0] === "remove" && args.length >= 2) {
 // Non-interactive: setup <email> <token> <baseUrl> (legacy single-instance)
 if (args.length >= 3 && args[0] !== "add" && args[0] !== "remove") {
   const [email, token, baseUrl] = args;
-  saveConfig({ email, token, baseUrl: baseUrl.replace(/\/$/, "") });
+  try {
+    saveConfig((config) => {
+      const normalizedBaseUrl = baseUrl.replace(/\/$/, "");
+      if (Array.isArray(config.instances)) {
+        const instance =
+          config.instances.find((candidate) => candidate.name === config.defaultInstance) ||
+          config.instances[0];
+        if (!instance) throw new Error("No Jira instances are configured.");
+        instance.email = email;
+        instance.token = token;
+        instance.baseUrl = normalizedBaseUrl;
+      } else {
+        if (config.instances !== undefined) {
+          throw new Error("Jira config has an invalid instances value.");
+        }
+        config.email = email;
+        config.token = token;
+        config.baseUrl = normalizedBaseUrl;
+      }
+    });
+  } catch (error) {
+    console.error("Setup failed:", error.message);
+    process.exit(1);
+  }
   console.log(`Config saved to ${configPath}`);
   process.exit(0);
 }
@@ -166,7 +186,10 @@ async function setup() {
   const team = await pickDefaultTeam(baseUrl.replace(/\/$/, ""), authStr);
   if (team) config.defaultTeam = team;
 
-  saveConfig(config);
+  saveConfig((latest) => {
+    for (const key of Object.keys(latest)) delete latest[key];
+    Object.assign(latest, config);
+  });
   console.log(`\nConfig saved to ${configPath}`);
 
   printFigmaStatus();
@@ -244,8 +267,12 @@ async function setInstanceTeam(config) {
   const authStr = Buffer.from(`${target.email}:${target.token}`).toString("base64");
   const team = await pickDefaultTeam(target.baseUrl, authStr);
   if (team) {
-    target.defaultTeam = team;
-    saveConfig(config);
+    const targetName = target.name;
+    saveConfig((latest) => {
+      const current = latest.instances?.find((instance) => instance.name === targetName);
+      if (!current) throw new Error(`Instance "${targetName}" no longer exists.`);
+      current.defaultTeam = team;
+    });
     console.log(`\nSaved default team "${team.name}" for instance "${target.name}".`);
   } else {
     console.log("No changes made.");
@@ -254,23 +281,14 @@ async function setInstanceTeam(config) {
 }
 
 async function addInstance(config) {
-  // Migrate old format if needed
+  let legacyName = null;
+  let legacyProjects = [];
   if (config.email && !config.instances) {
     const oldName = await ask("Name for your existing instance (e.g., work): ");
     const oldProjects = await ask("Project prefixes for existing instance (comma-separated, e.g., MODS,ENG): ");
-    config = {
-      instances: [{
-        name: oldName.trim() || "default",
-        email: config.email,
-        token: config.token,
-        baseUrl: config.baseUrl,
-        projects: oldProjects.split(",").map((p) => p.trim().toUpperCase()).filter(Boolean),
-      }],
-      defaultInstance: oldName.trim() || "default",
-    };
+    legacyName = oldName.trim() || "default";
+    legacyProjects = configStore.normalizeProjects(oldProjects.split(","));
   }
-
-  if (!config.instances) config.instances = [];
 
   console.log("\n--- Add New Instance ---\n");
   console.log("To get your Jira API token:");
@@ -283,7 +301,7 @@ async function addInstance(config) {
   const token = await ask("Jira API token: ");
   const baseUrl = await ask("Jira base URL (e.g., https://company.atlassian.net): ");
   const projectsInput = await ask("Project prefixes (comma-separated, e.g., SIDE,FUN): ");
-  const projects = projectsInput.split(",").map((p) => p.trim().toUpperCase()).filter(Boolean);
+  const projects = configStore.normalizeProjects(projectsInput.split(","));
 
   const trimmedBaseUrl = baseUrl.trim().replace(/\/$/, "");
   const authStr = Buffer.from(`${email.trim()}:${token.trim()}`).toString("base64");
@@ -298,27 +316,49 @@ async function addInstance(config) {
   };
   if (team) instance.defaultTeam = team;
 
-  // Replace or add
-  const idx = config.instances.findIndex((i) => i.name === instance.name);
-  if (idx >= 0) {
-    config.instances[idx] = instance;
-  } else {
-    config.instances.push(instance);
-  }
-
-  if (!config.defaultInstance) config.defaultInstance = instance.name;
-
   const setDefault = await ask(`Set "${instance.name}" as default? (y/N): `);
-  if (setDefault.trim().toLowerCase() === "y") {
-    config.defaultInstance = instance.name;
-  }
+  const makeDefault = setDefault.trim().toLowerCase() === "y";
 
-  saveConfig(config);
+  const savedConfig = saveConfig((latest) => {
+    if (legacyName && !Array.isArray(latest.instances)) {
+      configStore.migrateLegacyConfig(latest, legacyName);
+      const migrated = latest.instances.find((item) => item.name === legacyName);
+      migrated.projects = configStore.normalizeProjects([
+        ...(migrated.projects || []),
+        ...legacyProjects,
+      ]);
+    } else {
+      configStore.migrateLegacyConfig(latest);
+    }
+
+    const idx = latest.instances.findIndex((item) => item.name === instance.name);
+    const previous = idx >= 0 ? latest.instances[idx] : {};
+    const savedProjects = configStore.normalizeProjects([
+      ...(previous.projects || []),
+      ...instance.projects,
+    ]);
+    configStore.assertNoDuplicateProjectOwnership(latest, instance.name, savedProjects);
+    const toSave = {
+      ...previous,
+      ...instance,
+      projects: savedProjects,
+    };
+    if (idx >= 0) {
+      latest.instances[idx] = toSave;
+    } else {
+      latest.instances.push(toSave);
+    }
+    if (!latest.defaultInstance || makeDefault) {
+      latest.defaultInstance = instance.name;
+    }
+    return latest;
+  });
+
   console.log(`\nInstance "${instance.name}" saved to ${configPath}`);
 
   console.log("\nAll instances:");
-  for (const inst of config.instances) {
-    const isDefault = inst.name === config.defaultInstance ? " (default)" : "";
+  for (const inst of savedConfig.instances) {
+    const isDefault = inst.name === savedConfig.defaultInstance ? " (default)" : "";
     const projs = inst.projects?.length > 0 ? ` [${inst.projects.join(", ")}]` : "";
     console.log(`  - ${inst.name}${isDefault}: ${inst.baseUrl}${projs}`);
   }

@@ -1,8 +1,24 @@
-const { describe, it, beforeEach, afterEach, mock } = require("node:test");
+const { describe, it, beforeEach, afterEach, after, mock } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+
+const testHome = fs.mkdtempSync(path.join(os.tmpdir(), "jira-mcp-policy-test-"));
+const testConfigPath = path.join(testHome, ".config", "jira-mcp", "config.json");
+fs.mkdirSync(path.dirname(testConfigPath), { recursive: true });
+fs.writeFileSync(testConfigPath, JSON.stringify({
+  email: "test@example.com",
+  token: "test-token",
+  baseUrl: "https://test.atlassian.net",
+  projects: ["MODS", "PROJ"],
+}));
+process.env.HOME = testHome;
+process.env.JIRA_MCP_CONFIG_PATH = testConfigPath;
+
+after(() => {
+  fs.rmSync(testHome, { recursive: true, force: true });
+});
 
 // Same mock-injection scaffold as index.test.js so requiring index.js does
 // not start an MCP server or hit the network.
