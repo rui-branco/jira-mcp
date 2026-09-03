@@ -415,6 +415,225 @@ describe("findJiraTicketKeys", () => {
   });
 });
 
+// ============ jira_search_users ============
+
+describe("jira_search_users", () => {
+  const callToolHandler = toolHandlers["CallToolRequestSchema"];
+
+  beforeEach(() => {
+    fetchMock.mock.resetCalls();
+  });
+
+  it("preserves successful global user search behavior", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify([
+              {
+                displayName: "Julia Doe",
+                accountId: "account-1",
+                emailAddress: "julia@example.com",
+              },
+            ]),
+          ),
+      }),
+    );
+
+    const result = await callToolHandler({
+      params: {
+        name: "jira_search_users",
+        arguments: { query: "Julia", maxResults: 10 },
+      },
+    });
+
+    assert.deepStrictEqual(result, {
+      content: [
+        {
+          type: "text",
+          text: 'Found 1 user(s) for "Julia":\n\n- **Julia Doe** (accountId: account-1, email: julia@example.com)',
+        },
+      ],
+    });
+    assert.equal(fetchMock.mock.calls.length, 1);
+    assert.equal(fetchMock.mock.calls[0].arguments[1].method, "GET");
+    assert.ok(
+      fetchMock.mock.calls[0].arguments[0].endsWith(
+        "/rest/api/3/user/search?query=Julia&maxResults=10",
+      ),
+    );
+  });
+
+  it("falls back to issue-scoped assignable users when global search is empty", async () => {
+    fetchMock.mock.mockImplementation((url) =>
+      Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            url.includes("/user/assignable/search")
+              ? JSON.stringify([
+                  { displayName: "Assignable User", accountId: "account-2" },
+                ])
+              : JSON.stringify([]),
+          ),
+      }),
+    );
+
+    const query = "Jane Doe+test@example.com & other";
+    const result = await callToolHandler({
+      params: {
+        name: "jira_search_users",
+        arguments: {
+          query,
+          maxResults: 10,
+          issueKey: "MODS-123",
+        },
+      },
+    });
+
+    assert.ok(result.content[0].text.includes("Found 1 user(s)"));
+    assert.equal(fetchMock.mock.calls.length, 2);
+    assert.ok(
+      fetchMock.mock.calls[0].arguments[0].endsWith(
+        "/rest/api/3/user/search?query=Jane%20Doe%2Btest%40example.com%20%26%20other&maxResults=10",
+      ),
+    );
+    assert.ok(
+      fetchMock.mock.calls[1].arguments[0].endsWith(
+        "/rest/api/3/user/assignable/search?issueKey=MODS-123&query=Jane%20Doe%2Btest%40example.com%20%26%20other&maxResults=10",
+      ),
+    );
+  });
+
+  it("falls back to project-scoped assignable users when global search is empty", async () => {
+    fetchMock.mock.mockImplementation((url) =>
+      Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            url.includes("/user/assignable/search")
+              ? JSON.stringify([
+                  { displayName: "Project User", accountId: "account-3" },
+                ])
+              : JSON.stringify([]),
+          ),
+      }),
+    );
+
+    const result = await callToolHandler({
+      params: {
+        name: "jira_search_users",
+        arguments: { query: "Alex", maxResults: 3, projectKey: "MODS" },
+      },
+    });
+
+    assert.ok(result.content[0].text.includes("Found 1 user(s)"));
+    assert.equal(fetchMock.mock.calls.length, 2);
+    assert.ok(
+      fetchMock.mock.calls[1].arguments[0].endsWith(
+        "/rest/api/3/user/assignable/search?project=MODS&query=Alex&maxResults=3",
+      ),
+    );
+  });
+
+  it("uses the assignable fallback when global search is forbidden for user browsing", async () => {
+    fetchMock.mock.mockImplementation((url) => {
+      if (url.includes("/user/search?")) {
+        return Promise.resolve({
+          ok: false,
+          status: 403,
+          statusText: "Forbidden",
+          text: () =>
+            Promise.resolve(
+              JSON.stringify({
+                errorMessages: [
+                  "The calling user does not have permission to browse users and groups.",
+                ],
+              }),
+            ),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify([
+              { displayName: "Assignable User", accountId: "account-4" },
+            ]),
+          ),
+      });
+    });
+
+    const result = await callToolHandler({
+      params: {
+        name: "jira_search_users",
+        arguments: { query: "Julia", issueKey: "MODS-123" },
+      },
+    });
+
+    assert.ok(result.content[0].text.includes("Found 1 user(s)"));
+    assert.equal(fetchMock.mock.calls.length, 2);
+    assert.ok(
+      fetchMock.mock.calls[1].arguments[0].endsWith(
+        "/rest/api/3/user/assignable/search?issueKey=MODS-123&query=Julia&maxResults=5",
+      ),
+    );
+  });
+
+  it("keeps the existing no-users response when no assignment context is supplied", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify([])),
+      }),
+    );
+
+    const result = await callToolHandler({
+      params: {
+        name: "jira_search_users",
+        arguments: { query: "Nobody" },
+      },
+    });
+
+    assert.deepStrictEqual(result, {
+      content: [{ type: "text", text: 'No users found for "Nobody".' }],
+    });
+    assert.equal(fetchMock.mock.calls.length, 1);
+  });
+
+  it("does not mask unrelated global search errors", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: false,
+        status: 403,
+        statusText: "Forbidden",
+        text: () => Promise.resolve("Access denied for another reason"),
+      }),
+    );
+
+    const result = await callToolHandler({
+      params: {
+        name: "jira_search_users",
+        arguments: { query: "Julia", issueKey: "MODS-123" },
+      },
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /Jira API error: 403 Forbidden/);
+    assert.equal(fetchMock.mock.calls.length, 1);
+  });
+
+  it("documents assignment context arguments in the tool schema", async () => {
+    const result = await toolHandlers["ListToolsRequestSchema"]();
+    const tool = result.tools.find((entry) => entry.name === "jira_search_users");
+
+    assert.equal(tool.inputSchema.properties.issueKey.type, "string");
+    assert.equal(tool.inputSchema.properties.projectKey.type, "string");
+    assert.match(tool.description, /assignment-oriented searches/);
+  });
+});
+
 // ============ Team functions ============
 
 describe("resolveTeamId", () => {

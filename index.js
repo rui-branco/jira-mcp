@@ -474,9 +474,12 @@ async function fetchJira(endpoint, options = {}, instance = defaultInstance) {
   });
   if (!response.ok) {
     const errorBody = await response.text().catch(() => "");
-    throw new Error(
+    const error = new Error(
       `Jira API error: ${response.status} ${response.statusText}${errorBody ? ` - ${errorBody}` : ""}`,
     );
+    error.status = response.status;
+    error.body = errorBody;
+    throw error;
   }
   const text = await response.text();
   return text ? JSON.parse(text) : {};
@@ -2351,7 +2354,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_search_users",
         description:
-          "Search for Jira users by name or email. Returns account IDs and display names. Use this to find users for mentions or assignments. When multiple Jira instances are configured, use the 'instance' parameter to specify which one.",
+          "Search for Jira users by name or email. Returns account IDs and display names. Use this to find users for mentions or assignments. For assignment-oriented searches, provide issueKey or projectKey to find users assignable to that issue or project when global user browsing is unavailable. When multiple Jira instances are configured, use the 'instance' parameter to specify which one.",
         inputSchema: {
           type: "object",
           properties: {
@@ -2363,6 +2366,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             maxResults: {
               type: "number",
               description: "Max results (default 5)",
+            },
+            issueKey: {
+              type: "string",
+              description:
+                "Optional issue key for assignment-oriented searches (e.g., 'MODS-123'). If global user search is empty or user browsing is forbidden, search users assignable to this issue. The instance is auto-detected from the issue key when omitted.",
+            },
+            projectKey: {
+              type: "string",
+              description:
+                "Optional project key for assignment-oriented searches (e.g., 'MODS'). If global user search is empty or user browsing is forbidden, search users assignable to this project. Used when issueKey is not provided.",
             },
             instance: {
               type: "string",
@@ -3505,13 +3518,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "jira_search_users") {
-      const inst = getInstanceByName(args.instance);
+      const inst = resolveInstanceForTool(name, args);
       const maxResults = args.maxResults || 5;
-      const users = await fetchJira(
-        `/user/search?query=${encodeURIComponent(args.query)}&maxResults=${maxResults}`,
-        {},
-        inst,
-      );
+      const hasAssignmentContext = Boolean(args.issueKey || args.projectKey);
+      let users;
+      let useAssignableFallback = false;
+
+      try {
+        users = await fetchJira(
+          `/user/search?query=${encodeURIComponent(args.query)}&maxResults=${maxResults}`,
+          {},
+          inst,
+        );
+      } catch (error) {
+        const errorDetail = String(error.body || error.message || "").toLowerCase();
+        if (
+          hasAssignmentContext &&
+          error.status === 403 &&
+          /(browse users|user browsing|users and groups)/.test(errorDetail)
+        ) {
+          useAssignableFallback = true;
+        } else {
+          throw error;
+        }
+      }
+
+      if (
+        useAssignableFallback ||
+        (hasAssignmentContext && (!users || users.length === 0))
+      ) {
+        const scope = args.issueKey
+          ? `issueKey=${encodeURIComponent(args.issueKey)}`
+          : `project=${encodeURIComponent(args.projectKey)}`;
+        users = await fetchJira(
+          `/user/assignable/search?${scope}&query=${encodeURIComponent(args.query)}&maxResults=${maxResults}`,
+          {},
+          inst,
+        );
+      }
+
       if (!users || users.length === 0) {
         return {
           content: [
