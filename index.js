@@ -2352,7 +2352,7 @@ After the tool succeeds, its response echoes the posted comment as a markdown bl
 Structure with Markdown: a one/two-sentence overview, then ## / ### headings (Overview, Details, Acceptance Criteria), '-' bullet lists, numbered steps, tables for structured data, **bold** key terms, fenced \`\`\` blocks for code/payloads. Blank line between blocks. Concise and scannable. Never use em/en dashes.`;
 
 const server = new Server(
-  { name: "jira-mcp", version: "1.0.0" },
+  { name: "jira-mcp", version: PKG_VERSION },
   { capabilities: { tools: { listChanged: true } }, instructions: SERVER_INSTRUCTIONS },
 );
 
