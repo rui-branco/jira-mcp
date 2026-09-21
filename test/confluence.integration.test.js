@@ -31,6 +31,9 @@ const testSpaceKey = process.env.CONFLUENCE_TEST_SPACE_KEY;
 const envReady = email && token && baseUrl;
 fs.writeFileSync(testConfigPath, JSON.stringify({ email, token, baseUrl }));
 process.env.HOME = testHome;
+// os.homedir() reads USERPROFILE on Windows and ignores HOME, so the sandbox
+// has to move both or the real ~/.config/jira-mcp config gets read/written.
+process.env.USERPROFILE = testHome;
 process.env.JIRA_MCP_CONFIG_PATH = testConfigPath;
 
 after(() => {

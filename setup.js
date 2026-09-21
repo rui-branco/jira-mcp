@@ -2,6 +2,7 @@
 
 const readline = require("readline");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const configStore = require("./config-store.js");
 
@@ -369,7 +370,7 @@ async function addInstance(config) {
 }
 
 function printFigmaStatus() {
-  const figmaConfigPath = path.join(process.env.HOME, ".config/figma-mcp/config.json");
+  const figmaConfigPath = path.join(os.homedir(), ".config/figma-mcp/config.json");
   if (fs.existsSync(figmaConfigPath)) {
     console.log("\n[OK] Figma MCP detected - Figma links in tickets will be fetched automatically");
   } else {

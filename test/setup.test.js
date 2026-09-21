@@ -12,6 +12,9 @@ const setupPath = path.join(__dirname, "..", "setup.js");
 const childEnv = {
   ...process.env,
   HOME: testHome,
+  // os.homedir() reads USERPROFILE on Windows and ignores HOME, so the child
+  // has to have both pointed at the sandbox to stay off the real home dir.
+  USERPROFILE: testHome,
   JIRA_MCP_CONFIG_PATH: testConfigPath,
 };
 

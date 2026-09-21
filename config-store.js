@@ -5,7 +5,7 @@ const os = require("os");
 
 const configPath = path.resolve(
   process.env.JIRA_MCP_CONFIG_PATH ||
-    path.join(process.env.HOME, ".config/jira-mcp/config.json"),
+    path.join(os.homedir(), ".config/jira-mcp/config.json"),
 );
 const configuredLockWaitMs = Number(process.env.JIRA_MCP_LOCK_WAIT_MS);
 const LOCK_WAIT_MS =

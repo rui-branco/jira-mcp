@@ -15,37 +15,47 @@ const {
   ListToolsRequestSchema,
 } = require("@modelcontextprotocol/sdk/types.js");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const fetch = require("node-fetch");
 const configStore = require("./config-store.js");
-const { spawn, execSync } = require("child_process");
+const { spawn } = require("child_process");
 
-// Auto-update: check GitHub for new commits, install in background
-const GITHUB_REPO = "rui-branco/jira-mcp";
-const INSTALLED_SHA_FILE = path.join(__dirname, ".installed-sha");
-try {
-  const localSha = fs.existsSync(INSTALLED_SHA_FILE)
-    ? fs.readFileSync(INSTALLED_SHA_FILE, "utf-8").trim()
-    : "";
-  const remoteSha = execSync(
-    `git ls-remote https://github.com/${GITHUB_REPO}.git HEAD`,
-    { stdio: "pipe", timeout: 5000 },
-  )
-    .toString()
-    .split("\t")[0]
-    .trim();
-  if (remoteSha && remoteSha !== localSha) {
-    const child = spawn(
-      "sh",
-      [
-        "-c",
-        `npm install -g git+ssh://git@github.com/${GITHUB_REPO}.git && echo "${remoteSha}" > "${INSTALLED_SHA_FILE}"`,
-      ],
-      { stdio: "ignore", detached: true },
+const PKG_VERSION = require("./package.json").version;
+
+// Auto-update: ask the npm registry on every start what the latest published
+// version is, and install it in the background when it isn't the one we're
+// running. The package ships through npm, so there's no git involved: a plain
+// fetch plus an npm install. Runs detached from startup so the server begins
+// serving stdio immediately.
+const NPM_PACKAGE = "@rui.branco/jira-mcp";
+(async () => {
+  try {
+    const res = await fetch(
+      `https://registry.npmjs.org/${encodeURIComponent(NPM_PACKAGE)}/latest`,
+      { signal: AbortSignal.timeout(5000) },
     );
-    child.unref();
+    const latest = (await res.json()).version;
+    if (latest && latest !== PKG_VERSION) {
+      // Passed as one shell string rather than an argv array: npm is npm.cmd on
+      // Windows, and since Node 18.20.2 spawning a .cmd without a shell throws
+      // EINVAL outright (CVE-2024-27980 hardening). shell:true picks cmd.exe
+      // there and /bin/sh elsewhere, so this stays portable — unlike the old
+      // hardcoded `sh`, which simply doesn't exist on Windows. The command is a
+      // fixed literal with no interpolation, so there's nothing to inject.
+      const child = spawn(`npm install -g ${NPM_PACKAGE}`, {
+        shell: true,
+        stdio: "ignore",
+      });
+      // A spawn failure (npm missing from PATH) arrives as an async 'error'
+      // event, which no try/catch around the spawn can see — left unhandled it
+      // would take the whole server down at startup. Swallow it here.
+      child.on("error", () => {});
+    }
+  } catch {
+    /* offline, slow registry, or bad response — no-op */
   }
-} catch {}
+})();
 
 // Load Jira config (supports single-instance and multi-instance formats)
 const rawConfig = configStore.loadConfigStrict();
@@ -142,7 +152,7 @@ function getInstanceByName(name) {
 // Load Figma config (optional)
 let figmaConfig = null;
 const figmaConfigPath = path.join(
-  process.env.HOME,
+  os.homedir(),
   ".config/figma-mcp/config.json",
 );
 try {
@@ -155,11 +165,11 @@ try {
 
 // Directories
 const attachmentDir = path.join(
-  process.env.HOME,
+  os.homedir(),
   ".config/jira-mcp/attachments",
 );
 const figmaExportsDir = path.join(
-  process.env.HOME,
+  os.homedir(),
   ".config/figma-mcp/exports",
 );
 
@@ -315,7 +325,7 @@ function recordDryRunCall(call) {
 
 // ---- Audit log ----
 const AUDIT_LOG_PATH = path.join(
-  process.env.HOME || "/tmp",
+  os.homedir(),
   ".config/jira-mcp/audit.log",
 );
 const AUDIT_LOG_MAX_BYTES = 10 * 1024 * 1024;
@@ -905,7 +915,7 @@ async function downloadAttachment(url, filename, issueKey, instance) {
 // ============ CONFLUENCE FUNCTIONS ============
 
 const confluenceAttachmentDir = path.join(
-  process.env.HOME,
+  os.homedir(),
   ".config/jira-mcp/confluence-attachments",
 );
 if (!fs.existsSync(confluenceAttachmentDir)) {

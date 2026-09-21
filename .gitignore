@@ -14,5 +14,3 @@ node_modules/
 # Downloaded attachments
 ../attachments/
 
-# Auto-update marker
-.installed-sha

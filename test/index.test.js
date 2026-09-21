@@ -14,6 +14,9 @@ fs.writeFileSync(testConfigPath, JSON.stringify({
   projects: ["MODS", "PROJ"],
 }));
 process.env.HOME = testHome;
+// os.homedir() reads USERPROFILE on Windows and ignores HOME, so the sandbox
+// has to move both or the real ~/.config/jira-mcp config gets read/written.
+process.env.USERPROFILE = testHome;
 process.env.JIRA_MCP_CONFIG_PATH = testConfigPath;
 
 after(() => {
