@@ -136,6 +136,8 @@ Use `@FirstName LastName` syntax to mention users in comments:
 # The mention is automatically resolved and the user gets notified
 ```
 
+Mentions are resolved with Jira's global user search first. On instances where your account lacks the global "Browse users and groups" permission (the search comes back empty), the name is looked up among users assignable to the ticket being commented on (`/user/assignable/search?issueKey=...`), or, when no ticket is known, among users assignable in any of the instance's configured `projects` (one `/user/assignable/search?project=...` request per project, results merged and deduplicated; a project you can't access is skipped). A name that still can't be resolved is posted as plain text, which notifies nobody. `jira_search_users` uses the same configured-projects fallback when you don't pass `issueKey` or `projectKey`.
+
 ### Example Output
 
 ```
@@ -249,6 +251,43 @@ Config stored at `~/.config/jira-mcp/config.json`:
   "baseUrl": "https://company.atlassian.net"
 }
 ```
+
+#### Multiple instances
+
+```json
+{
+  "instances": [
+    {
+      "name": "work",
+      "email": "you@company.com",
+      "token": "...",
+      "baseUrl": "https://company.atlassian.net",
+      "projects": ["PROJ", "ENG"]
+    },
+    {
+      "name": "client",
+      "email": "you@company.com",
+      "token": "...",
+      "baseUrl": "https://client.atlassian.net",
+      "projects": ["CLI"],
+      "paths": ["~/code/client-app", "/Users/you/code/client-api"]
+    }
+  ],
+  "defaultInstance": "work"
+}
+```
+
+- `projects`: project key prefixes routed to the instance. Tools that receive an issue or project key (e.g. `CLI-12`) are routed to the instance that owns the prefix.
+- `paths` (optional): project directories for which this instance is the default. The MCP server runs with your project directory as its working directory. If that directory is equal to or inside one of these paths, the instance becomes this session's default (the longest matching path wins). Paths must be absolute, and `~` expands to your home directory.
+- `defaultInstance`: global fallback used when neither `JIRA_MCP_INSTANCE` nor a `paths` entry applies. The per-session choice never overwrites it.
+
+The session default is used whenever a call has no issue or project key to route by, for example `jira_search`, `jira_search_users` without a key, or `jira_get_myself`. It is resolved at startup in this order:
+
+1. `JIRA_MCP_INSTANCE=<name>` environment variable (ignored with a warning if no instance has that name).
+2. The instance whose `paths` contain the working directory.
+3. `defaultInstance` from the config (or the first instance if it's unset).
+
+`jira_list_instances` shows the current session default and where it came from (env, path, or config). `jira_add_instance` with `setDefault: true` changes `defaultInstance` in the config, but the session keeps its env or path choice when one applies.
 
 ## Error Handling
 

@@ -106,10 +106,89 @@ if (Array.isArray(rawConfig.instances)) {
   instances = [legacyInstance];
 }
 
-// Resolve default instance
-let defaultInstance =
-  (rawConfig.defaultInstance && instances.find((i) => i.name === rawConfig.defaultInstance)) ||
-  instances[0];
+// Resolve default instance. The config `defaultInstance` is the global
+// fallback; this process's session default (used for routing fallbacks and
+// fetch defaults) is picked by env JIRA_MCP_INSTANCE, then by the longest
+// instance `paths` entry containing the working directory, then the config.
+function realpathOrSelf(value) {
+  try {
+    return fs.realpathSync(value);
+  } catch {
+    return value;
+  }
+}
+
+function expandConfiguredPath(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  let expanded = value.trim();
+  if (expanded === "~" || expanded.startsWith("~/")) {
+    expanded = path.join(process.env.HOME || "", expanded.slice(1));
+  }
+  if (!path.isAbsolute(expanded)) return null;
+  return realpathOrSelf(path.resolve(expanded));
+}
+
+function isSameOrInsidePath(dir, parent) {
+  const relative = path.relative(parent, dir);
+  return relative === "" ||
+    (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function resolveSessionDefault(instanceList, configDefaultName, cwd, env) {
+  const configDefault =
+    (configDefaultName && instanceList.find((i) => i.name === configDefaultName)) ||
+    instanceList[0];
+  const envName = typeof env.JIRA_MCP_INSTANCE === "string" ? env.JIRA_MCP_INSTANCE.trim() : "";
+  if (envName) {
+    const envInstance = instanceList.find((i) => i.name === envName);
+    if (envInstance) return { instance: envInstance, source: "env" };
+  }
+  const ignoredEnv = envName || undefined;
+
+  let best = null;
+  if (cwd) {
+    const realCwd = realpathOrSelf(path.resolve(cwd));
+    for (const instance of instanceList) {
+      for (const configured of Array.isArray(instance.paths) ? instance.paths : []) {
+        const resolved = expandConfiguredPath(configured);
+        if (
+          resolved &&
+          isSameOrInsidePath(realCwd, resolved) &&
+          (!best || resolved.length > best.path.length)
+        ) {
+          best = { instance, source: "path", path: resolved, ignoredEnv };
+        }
+      }
+    }
+  }
+  return best || { instance: configDefault, source: "config", ignoredEnv };
+}
+
+let sessionCwd = null;
+try {
+  sessionCwd = process.cwd();
+} catch {
+  // Working directory was removed; fall back to env/config only.
+}
+
+let defaultInstance;
+let sessionDefault;
+function applySessionDefault() {
+  sessionDefault = resolveSessionDefault(instances, rawConfig.defaultInstance, sessionCwd, process.env);
+  defaultInstance = sessionDefault.instance;
+}
+applySessionDefault();
+if (sessionDefault.ignoredEnv) {
+  console.error(`jira-mcp: JIRA_MCP_INSTANCE "${sessionDefault.ignoredEnv}" does not match a configured instance, ignoring it`);
+}
+
+function describeSessionDefault() {
+  if (sessionDefault.source === "env") return "env JIRA_MCP_INSTANCE";
+  if (sessionDefault.source === "path") {
+    return `path ${sessionDefault.path} (working directory ${sessionCwd})`;
+  }
+  return "config defaultInstance";
+}
 
 // Instance resolution helpers
 function getMappedInstancesForProject(projectPrefix) {
@@ -1117,7 +1196,35 @@ const ECHO_DIRECTIVE =
 // Cache for user lookups to avoid repeated API calls
 const userCache = new Map();
 
-async function searchUser(query, instance = defaultInstance) {
+// Users assignable in any of the instance's configured projects. Visible even
+// when the account lacks the global "Browse users and groups" permission.
+// One request per project because /user/assignable/multiProjectSearch returns
+// the intersection (users assignable in ALL listed projects), not the union.
+// Results are merged in config order, deduped by accountId; a project that
+// errors (e.g. 403/404) is skipped.
+async function searchAssignableUsersInProjects(instance, query, maxResults) {
+  const results = await Promise.all(
+    (instance.projects || []).map((project) =>
+      fetchJira(
+        `/user/assignable/search?project=${encodeURIComponent(project)}&query=${encodeURIComponent(query)}&maxResults=${maxResults}`,
+        {},
+        instance,
+      ).catch(() => []),
+    ),
+  );
+  const users = [];
+  const seen = new Set();
+  for (const projectUsers of results) {
+    for (const user of Array.isArray(projectUsers) ? projectUsers : []) {
+      if (seen.has(user.accountId)) continue;
+      seen.add(user.accountId);
+      users.push(user);
+    }
+  }
+  return users.slice(0, maxResults);
+}
+
+async function searchUser(query, instance = defaultInstance, issueKey = null) {
   // Check cache first (instance-aware)
   const cacheKey = `${instance.name}:${query.toLowerCase()}`;
   if (userCache.has(cacheKey)) {
@@ -1126,11 +1233,22 @@ async function searchUser(query, instance = defaultInstance) {
 
   try {
     // Search for users by display name
-    const users = await fetchJira(
+    let users = await fetchJira(
       `/user/search?query=${encodeURIComponent(query)}&maxResults=5`,
       {},
       instance,
-    );
+    ).catch(() => []);
+    if (!Array.isArray(users) || users.length === 0) {
+      // Global search is empty without "Browse users and groups" — fall back
+      // to users assignable to the issue, else to the instance's projects.
+      users = issueKey
+        ? await fetchJira(
+          `/user/assignable/search?issueKey=${encodeURIComponent(issueKey)}&query=${encodeURIComponent(query)}&maxResults=5`,
+          {},
+          instance,
+        )
+        : await searchAssignableUsersInProjects(instance, query, 5);
+    }
     if (users && users.length > 0) {
       // Find best match - prefer exact match, then starts with, then contains
       const exactMatch = users.find(
@@ -1156,7 +1274,7 @@ async function searchUser(query, instance = defaultInstance) {
 
 // Parse text with @mentions and build ADF content
 // Parse inline formatting: **bold**, *italic*, `code`, [links](url), @mentions
-async function parseInlineFormatting(text, instance = defaultInstance) {
+async function parseInlineFormatting(text, instance = defaultInstance, issueKey = null) {
   const nodes = [];
   // Links, bold, italic, inline code, mentions — links must come first to avoid ** inside link text being parsed as bold
   const regex = /(\[([^\]]+)\]\(([^)]+)\)|`(.+?)`|\*\*(.+?)\*\*|\*(.+?)\*|~~(.+?)~~|@([A-Z][a-zA-Zà-ÿ]*(?:\s[A-Z][a-zA-Zà-ÿ]*)*))/g;
@@ -1192,7 +1310,7 @@ async function parseInlineFormatting(text, instance = defaultInstance) {
       // @Mention — regex may greedily capture extra capitalized words beyond the actual name.
       // After resolving, only consume the portion matching the display name.
       const captured = match[8].trim();
-      const user = await searchUser(captured, instance);
+      const user = await searchUser(captured, instance, issueKey);
       if (user) {
         nodes.push({
           type: "mention",
@@ -1302,7 +1420,7 @@ function listItemMatch(line) {
 // Recursively parse a (possibly nested) markdown list starting at lines[startIdx].
 // baseIndent is the indentation of items at this level; more-indented items are
 // folded into the previous item as a nested list. Returns {node, nextIndex}.
-async function parseListBlock(lines, startIdx, baseIndent, instance) {
+async function parseListBlock(lines, startIdx, baseIndent, instance, issueKey = null) {
   const items = [];
   let i = startIdx;
   let ordered = null;
@@ -1313,7 +1431,7 @@ async function parseListBlock(lines, startIdx, baseIndent, instance) {
     if (m.indent < baseIndent) break; // dedent: belongs to a parent list
     if (m.indent > baseIndent) {
       // Deeper indent: nest under the previous item at this level.
-      const sub = await parseListBlock(lines, i, m.indent, instance);
+      const sub = await parseListBlock(lines, i, m.indent, instance, issueKey);
       if (items.length > 0) {
         items[items.length - 1].content.push(sub.node);
       } else {
@@ -1324,7 +1442,7 @@ async function parseListBlock(lines, startIdx, baseIndent, instance) {
     }
     if (ordered === null) ordered = m.ordered; // list type set by first item
     else if (m.ordered !== ordered) break; // marker switched: caller starts a new list
-    const inlineContent = await parseInlineFormatting(m.text, instance);
+    const inlineContent = await parseInlineFormatting(m.text, instance, issueKey);
     items.push({
       type: "listItem",
       content: [{ type: "paragraph", content: inlineContent }],
@@ -1338,7 +1456,7 @@ async function parseListBlock(lines, startIdx, baseIndent, instance) {
 }
 
 // Parse text with markdown formatting and @mentions, build ADF content
-async function buildCommentADF(text, instance = defaultInstance) {
+async function buildCommentADF(text, instance = defaultInstance, issueKey = null) {
   // Sanitize: replace em dashes and en dashes with hyphen
   text = text.replace(/[—–]/g, "-");
 
@@ -1387,7 +1505,7 @@ async function buildCommentADF(text, instance = defaultInstance) {
     if (headingMatch) {
       const level = headingMatch[1].length;
       const headingText = headingMatch[2];
-      const inlineContent = await parseInlineFormatting(headingText, instance);
+      const inlineContent = await parseInlineFormatting(headingText, instance, issueKey);
       content.push({
         type: "heading",
         attrs: { level },
@@ -1404,7 +1522,7 @@ async function buildCommentADF(text, instance = defaultInstance) {
         quoteLines.push(lines[i].trim().substring(2));
         i++;
       }
-      const quoteContent = await parseInlineFormatting(quoteLines.join("\n"), instance);
+      const quoteContent = await parseInlineFormatting(quoteLines.join("\n"), instance, issueKey);
       content.push({
         type: "blockquote",
         content: [{ type: "paragraph", content: quoteContent }],
@@ -1436,7 +1554,7 @@ async function buildCommentADF(text, instance = defaultInstance) {
           const cellType = r === 0 && isHeader ? "tableHeader" : "tableCell";
           const adfCells = [];
           for (const cellText of tableRows[r]) {
-            const inlineContent = await parseInlineFormatting(cellText, instance);
+            const inlineContent = await parseInlineFormatting(cellText, instance, issueKey);
             adfCells.push({
               type: cellType,
               content: [{ type: "paragraph", content: inlineContent }],
@@ -1457,6 +1575,7 @@ async function buildCommentADF(text, instance = defaultInstance) {
         i,
         listStart.indent,
         instance,
+        issueKey,
       );
       content.push(node);
       i = nextIndex;
@@ -1478,7 +1597,7 @@ async function buildCommentADF(text, instance = defaultInstance) {
       !(lines[i].trim().startsWith("|") && lines[i].trim().endsWith("|"))
     ) {
       if (paragraphContent.length > 0) paragraphContent.push({ type: "hardBreak" });
-      const inlineNodes = await parseInlineFormatting(lines[i].trim(), instance);
+      const inlineNodes = await parseInlineFormatting(lines[i].trim(), instance, issueKey);
       paragraphContent.push(...inlineNodes);
       i++;
     }
@@ -2340,7 +2459,7 @@ async function getChangelogsBulk(jql, maxResults = 50, instance = defaultInstanc
 
 const SERVER_INSTRUCTIONS = `# jira-mcp usage rules
 
-- \`instance\` (optional, on most tools): multi-instance setups only. Omit it — it auto-detects from the issue key prefix, else uses the default instance.
+- \`instance\` (optional, on most tools): multi-instance setups only. Omit it — it auto-detects from the issue key prefix, else uses this session's default instance (see \`jira_list_instances\`).
 - \`dryRun\` (optional, on mutating tools): if true, returns the HTTP request that would be sent (method, endpoint, body) without calling Atlassian. Multi-step tools only show the first write.
 ${confluenceMode !== "always" ? "- Confluence tools are hidden until activated: call `confluence_enable` first when a task needs Confluence (pages, spaces, page comments, labels, attachments).\n" : ""}
 ## Writing Jira comments (jira_add_comment / jira_reply_comment / jira_edit_comment)
@@ -2740,7 +2859,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             setDefault: {
               type: "boolean",
-              description: "Set this instance as the default (default: false)",
+              description: "Set this instance as the config default (default: false). JIRA_MCP_INSTANCE or an instance whose paths contain the working directory still takes precedence for the current session.",
             },
             defaultTeam: {
               type: "string",
@@ -2776,7 +2895,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_list_instances",
         description:
-          "List all configured Jira instances with their names, URLs, project prefixes, and which is the default.",
+          "List all configured Jira instances with their names, URLs, project prefixes, paths, and which is the session default and why (env, path, or config).",
         inputSchema: {
           type: "object",
           properties: {},
@@ -3858,6 +3977,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           {},
           inst,
         );
+      } else if (!hasAssignmentContext && (!users || users.length === 0)) {
+        users = await searchAssignableUsersInProjects(inst, args.query, maxResults);
       }
 
       if (!users || users.length === 0) {
@@ -3947,7 +4068,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } else if (name === "jira_add_comment") {
       const inst = args.instance ? getInstanceByName(args.instance) : getInstanceForKey(args.issueKey);
       // Build ADF content with mention support
-      const adfContent = await buildCommentADF(args.comment, inst);
+      const adfContent = await buildCommentADF(args.comment, inst, args.issueKey);
       const body = {
         body: {
           version: 1,
@@ -4042,7 +4163,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } else if (name === "jira_edit_comment") {
       const inst = args.instance ? getInstanceByName(args.instance) : getInstanceForKey(args.issueKey);
       // Build ADF content with mention support
-      const adfContent = await buildCommentADF(args.comment, inst);
+      const adfContent = await buildCommentADF(args.comment, inst, args.issueKey);
       const body = {
         body: {
           version: 1,
@@ -4455,10 +4576,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         instances.push(savedInstance);
         activeInstance = savedInstance;
       }
-      defaultInstance =
-        instances.find((instance) => instance.name === persisted.defaultInstance) ||
-        instances[0];
       rawConfig.defaultInstance = persisted.defaultInstance;
+      applySessionDefault();
 
       const action = persisted.isUpdate ? "Updated" : "Added";
       const savedBaseUrl = activeInstance.baseUrl;
@@ -4466,7 +4585,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const projectTeams = activeInstance.projectTeams || {};
       let text = `${action} instance "${instName}" (${savedBaseUrl}).`;
       if (savedProjects.length > 0) text += ` Projects: ${savedProjects.join(", ")}.`;
-      if (args.setDefault) text += " Set as default.";
+      if (args.setDefault) {
+        text += " Set as default.";
+        if (defaultInstance.name !== instName) {
+          text += ` This session keeps using "${defaultInstance.name}" (from ${describeSessionDefault()}).`;
+        }
+      }
       if (projectTeamChange) {
         const pt = projectTeams[projectTeamChange.key];
         if (pt === "none") {
@@ -4528,10 +4652,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Update in-memory state only after the atomic config replacement succeeds.
       const idx = instances.findIndex((i) => i.name === instName);
       if (idx >= 0) instances.splice(idx, 1);
-      defaultInstance =
-        instances.find((instance) => instance.name === removal.defaultInstance) ||
-        instances[0];
       rawConfig.defaultInstance = removal.defaultInstance;
+      applySessionDefault();
 
       return { content: [{ type: "text", text: `Removed instance "${instName}".` }] };
 
@@ -4539,12 +4661,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (instances.length === 0) {
         return { content: [{ type: "text", text: "No instances configured." }] };
       }
-      const currentDefault = rawConfig.defaultInstance || instances[0].name;
+      const configDefault =
+        instances.find((inst) => inst.name === rawConfig.defaultInstance) || instances[0];
       let text = `# Configured Jira Instances (${instances.length})\n\n`;
+      text += `Session default: **${defaultInstance.name}** (from ${describeSessionDefault()}). Config default: ${configDefault.name}.\n`;
+      if (sessionDefault.ignoredEnv) {
+        text += `JIRA_MCP_INSTANCE "${sessionDefault.ignoredEnv}" does not match a configured instance and is ignored.\n`;
+      }
+      text += "\n";
       const missingTeam = [];
       for (const inst of instances) {
-        const isDefault = inst.name === currentDefault ? " **(default)**" : "";
+        let isDefault = inst.name === defaultInstance.name ? " **(default)**" : "";
+        if (inst.name === configDefault.name && inst.name !== defaultInstance.name) {
+          isDefault = " (config default)";
+        }
         const projs = inst.projects?.length > 0 ? `\n  Projects: ${inst.projects.join(", ")}` : "";
+        const paths = Array.isArray(inst.paths) && inst.paths.length > 0 ? `\n  Paths: ${inst.paths.join(", ")}` : "";
         const team = inst.defaultTeam === "none" ? "\n  Default team: None (disabled)" : inst.defaultTeam ? `\n  Default team: ${inst.defaultTeam.name}` : "";
         let projTeams = "";
         if (inst.projectTeams && Object.keys(inst.projectTeams).length > 0) {
@@ -4553,7 +4685,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             projTeams += `\n  ${pk} team: ${ptName}`;
           }
         }
-        text += `- **${inst.name}**${isDefault}: ${inst.baseUrl} (${inst.email})${projs}${team}${projTeams}\n`;
+        text += `- **${inst.name}**${isDefault}: ${inst.baseUrl} (${inst.email})${projs}${paths}${team}${projTeams}\n`;
         if (!inst.defaultTeam) missingTeam.push(inst);
       }
       if (missingTeam.length > 0) {
@@ -5768,6 +5900,7 @@ if (typeof module !== "undefined") {
     checkRateLimit, _setClockForTests, _resetBucketsForTests,
     extractRoutingPrefixes, probeJiraProject, discoverProjectInstance,
     persistDiscoveredProjects, resolveInstanceForTool, _injectDryRunSchema,
+    resolveSessionDefault,
     AUDIT_LOG_PATH,
   };
 }

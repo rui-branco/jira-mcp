@@ -439,6 +439,37 @@ describe("findJiraTicketKeys", () => {
 
 // ============ jira_search_users ============
 
+// Mocks user lookups by endpoint: global /user/search, issue-scoped and
+// per-project /user/assignable/search. A project mapped to a number fails
+// with that HTTP status.
+function mockUserLookups({ global = [], issue = [], projects = {} }) {
+  fetchMock.mock.mockImplementation((url) => {
+    let body = {};
+    if (url.includes("/user/search?")) body = global;
+    else if (url.includes("/user/assignable/search?issueKey=")) body = issue;
+    else if (url.includes("/user/assignable/search?project=")) {
+      const configured = projects[new URL(url).searchParams.get("project")];
+      if (typeof configured === "number") {
+        return Promise.resolve({
+          ok: false,
+          status: configured,
+          statusText: "Error",
+          text: () => Promise.resolve(""),
+        });
+      }
+      body = configured || [];
+    }
+    return Promise.resolve({
+      ok: true,
+      text: () => Promise.resolve(JSON.stringify(body)),
+    });
+  });
+}
+
+function fetchedUrls() {
+  return fetchMock.mock.calls.map((call) => call.arguments[0]);
+}
+
 describe("jira_search_users", () => {
   const callToolHandler = toolHandlers["CallToolRequestSchema"];
 
@@ -604,12 +635,7 @@ describe("jira_search_users", () => {
   });
 
   it("keeps the existing no-users response when no assignment context is supplied", async () => {
-    fetchMock.mock.mockImplementation(() =>
-      Promise.resolve({
-        ok: true,
-        text: () => Promise.resolve(JSON.stringify([])),
-      }),
-    );
+    mockUserLookups({});
 
     const result = await callToolHandler({
       params: {
@@ -621,6 +647,103 @@ describe("jira_search_users", () => {
     assert.deepStrictEqual(result, {
       content: [{ type: "text", text: 'No users found for "Nobody".' }],
     });
+    // Global search, then one assignable search per configured project.
+    assert.deepStrictEqual(fetchedUrls(), [
+      "https://test.atlassian.net/rest/api/3/user/search?query=Nobody&maxResults=5",
+      "https://test.atlassian.net/rest/api/3/user/assignable/search?project=MODS&query=Nobody&maxResults=5",
+      "https://test.atlassian.net/rest/api/3/user/assignable/search?project=PROJ&query=Nobody&maxResults=5",
+    ]);
+  });
+
+  it("finds a user assignable in only one of the configured projects when no issueKey or projectKey is given", async () => {
+    mockUserLookups({
+      projects: {
+        MODS: [],
+        PROJ: [{ displayName: "Matthias Bauer", accountId: "account-5" }],
+      },
+    });
+
+    const result = await callToolHandler({
+      params: {
+        name: "jira_search_users",
+        arguments: { query: "Matthias" },
+      },
+    });
+
+    assert.deepStrictEqual(result, {
+      content: [
+        {
+          type: "text",
+          text: 'Found 1 user(s) for "Matthias":\n\n- **Matthias Bauer** (accountId: account-5)',
+        },
+      ],
+    });
+    assert.deepStrictEqual(fetchedUrls(), [
+      "https://test.atlassian.net/rest/api/3/user/search?query=Matthias&maxResults=5",
+      "https://test.atlassian.net/rest/api/3/user/assignable/search?project=MODS&query=Matthias&maxResults=5",
+      "https://test.atlassian.net/rest/api/3/user/assignable/search?project=PROJ&query=Matthias&maxResults=5",
+    ]);
+  });
+
+  it("merges per-project results deduped by accountId in config order and caps to maxResults", async () => {
+    const alice = { displayName: "Alex Alice", accountId: "account-a" };
+    const bob = { displayName: "Alex Bob", accountId: "account-b" };
+    const carol = { displayName: "Alex Carol", accountId: "account-c" };
+    mockUserLookups({ projects: { MODS: [alice, bob], PROJ: [bob, carol] } });
+
+    const all = await callToolHandler({
+      params: { name: "jira_search_users", arguments: { query: "Alex" } },
+    });
+    assert.equal(
+      all.content[0].text,
+      'Found 3 user(s) for "Alex":\n\n- **Alex Alice** (accountId: account-a)\n- **Alex Bob** (accountId: account-b)\n- **Alex Carol** (accountId: account-c)',
+    );
+
+    const capped = await callToolHandler({
+      params: { name: "jira_search_users", arguments: { query: "Alex", maxResults: 2 } },
+    });
+    assert.equal(
+      capped.content[0].text,
+      'Found 2 user(s) for "Alex":\n\n- **Alex Alice** (accountId: account-a)\n- **Alex Bob** (accountId: account-b)',
+    );
+  });
+
+  it("skips a configured project that errors instead of failing the search", async () => {
+    mockUserLookups({
+      projects: {
+        MODS: 403,
+        PROJ: [{ displayName: "Matthias Bauer", accountId: "account-5" }],
+      },
+    });
+
+    const result = await callToolHandler({
+      params: { name: "jira_search_users", arguments: { query: "Matthias" } },
+    });
+
+    assert.equal(result.isError, undefined);
+    assert.ok(result.content[0].text.includes("Found 1 user(s)"));
+    assert.ok(result.content[0].text.includes("Matthias Bauer"));
+  });
+
+  it("does not use the configured-projects fallback when global search finds users", async () => {
+    fetchMock.mock.mockImplementation(() =>
+      Promise.resolve({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify([{ displayName: "Global User", accountId: "account-6" }]),
+          ),
+      }),
+    );
+
+    const result = await callToolHandler({
+      params: {
+        name: "jira_search_users",
+        arguments: { query: "Global" },
+      },
+    });
+
+    assert.ok(result.content[0].text.includes("Found 1 user(s)"));
     assert.equal(fetchMock.mock.calls.length, 1);
   });
 
@@ -653,6 +776,180 @@ describe("jira_search_users", () => {
     assert.equal(tool.inputSchema.properties.issueKey.type, "string");
     assert.equal(tool.inputSchema.properties.projectKey.type, "string");
     assert.match(tool.description, /assignment-oriented searches/);
+  });
+});
+
+// ============ @mention resolution ============
+
+describe("@mention resolution", () => {
+  const callToolHandler = toolHandlers["CallToolRequestSchema"];
+  const matthias = { displayName: "Matthias Bauer", accountId: "account-mb" };
+
+  // Each test uses its own instance name so the per-instance user cache
+  // does not leak results between tests.
+  function testInstance(name) {
+    return {
+      name,
+      baseUrl: "https://ito.atlassian.net",
+      auth: "dGVzdA==",
+      projects: ["AI", "ITT", "IAS"],
+    };
+  }
+
+  beforeEach(() => {
+    fetchMock.mock.resetCalls();
+  });
+
+  it("resolves a mention via the issue-scoped assignable fallback when global search is empty", async () => {
+    mockUserLookups({
+      issue: [
+        { displayName: "Matthias Bauer Senior", accountId: "account-other" },
+        matthias,
+      ],
+    });
+
+    const result = await buildCommentADF(
+      "@Matthias Bauer please check",
+      testInstance("mention-issue"),
+      "IAS-17",
+    );
+
+    assert.deepStrictEqual(result[0].content, [
+      { type: "mention", attrs: { id: "account-mb", text: "@Matthias Bauer" } },
+      { type: "text", text: " please check" },
+    ]);
+    assert.deepStrictEqual(fetchedUrls(), [
+      "https://ito.atlassian.net/rest/api/3/user/search?query=Matthias%20Bauer&maxResults=5",
+      "https://ito.atlassian.net/rest/api/3/user/assignable/search?issueKey=IAS-17&query=Matthias%20Bauer&maxResults=5",
+    ]);
+  });
+
+  it("falls back to per-project assignable search when no issue key is known", async () => {
+    // Matthias is assignable in IAS only (multiProjectSearch would return the
+    // intersection, i.e. nobody); ITT is forbidden and must not break the lookup.
+    mockUserLookups({ projects: { AI: [], ITT: 403, IAS: [matthias] } });
+
+    const result = await parseInlineFormatting(
+      "@Matthias Bauer thanks",
+      testInstance("mention-projects"),
+    );
+
+    assert.deepStrictEqual(result[0], {
+      type: "mention",
+      attrs: { id: "account-mb", text: "@Matthias Bauer" },
+    });
+    assert.deepStrictEqual(fetchedUrls(), [
+      "https://ito.atlassian.net/rest/api/3/user/search?query=Matthias%20Bauer&maxResults=5",
+      "https://ito.atlassian.net/rest/api/3/user/assignable/search?project=AI&query=Matthias%20Bauer&maxResults=5",
+      "https://ito.atlassian.net/rest/api/3/user/assignable/search?project=ITT&query=Matthias%20Bauer&maxResults=5",
+      "https://ito.atlassian.net/rest/api/3/user/assignable/search?project=IAS&query=Matthias%20Bauer&maxResults=5",
+    ]);
+  });
+
+  it("threads the issue key into mentions inside lists", async () => {
+    mockUserLookups({ issue: [matthias] });
+
+    const result = await buildCommentADF(
+      "- @Matthias Bauer to verify",
+      testInstance("mention-list"),
+      "IAS-17",
+    );
+
+    assert.equal(result[0].type, "bulletList");
+    assert.deepStrictEqual(result[0].content[0].content[0].content[0], {
+      type: "mention",
+      attrs: { id: "account-mb", text: "@Matthias Bauer" },
+    });
+    assert.ok(fetchedUrls()[1].includes("/user/assignable/search?issueKey=IAS-17&"));
+  });
+
+  it("keeps using the global search result without a fallback call", async () => {
+    mockUserLookups({ global: [matthias] });
+
+    const result = await parseInlineFormatting(
+      "@Matthias Bauer hi",
+      testInstance("mention-global"),
+      "IAS-17",
+    );
+
+    assert.equal(result[0].type, "mention");
+    assert.equal(fetchMock.mock.calls.length, 1);
+  });
+
+  it("leaves the mention as plain text when no lookup finds the user", async () => {
+    mockUserLookups({});
+
+    const result = await parseInlineFormatting(
+      "@Nobody Here hi",
+      testInstance("mention-none"),
+      "IAS-17",
+    );
+
+    assert.deepStrictEqual(result, [
+      { type: "text", text: "@Nobody Here" },
+      { type: "text", text: " hi" },
+    ]);
+  });
+
+  it("dry-run jira_add_comment sends a real mention node resolved via the issue fallback", async () => {
+    mockUserLookups({ issue: [matthias] });
+
+    const result = await callToolHandler({
+      params: {
+        name: "jira_add_comment",
+        arguments: {
+          issueKey: "MODS-17",
+          comment: "@Matthias Bauer ready for review.",
+          dryRun: true,
+        },
+      },
+    });
+
+    const output = JSON.parse(result.content[0].text);
+    assert.equal(output.dryRun, true);
+    assert.equal(output.plan.length, 1);
+    assert.equal(output.plan[0].method, "POST");
+    assert.equal(output.plan[0].endpoint, "/issue/MODS-17/comment");
+    assert.deepStrictEqual(output.plan[0].body.body.content[0].content, [
+      { type: "mention", attrs: { id: "account-mb", text: "@Matthias Bauer" } },
+      { type: "text", text: " ready for review." },
+    ]);
+    // Lookups ran for real (GET); the write did not.
+    assert.ok(
+      fetchMock.mock.calls.every((call) => call.arguments[1].method === "GET"),
+    );
+    assert.ok(
+      fetchedUrls()[1].endsWith(
+        "/rest/api/3/user/assignable/search?issueKey=MODS-17&query=Matthias%20Bauer&maxResults=5",
+      ),
+    );
+  });
+
+  it("dry-run jira_edit_comment resolves mentions with the issue key", async () => {
+    mockUserLookups({
+      issue: [{ displayName: "Anna Schmidt", accountId: "account-as" }],
+    });
+
+    const result = await callToolHandler({
+      params: {
+        name: "jira_edit_comment",
+        arguments: {
+          issueKey: "PROJ-9",
+          commentId: "1001",
+          comment: "@Anna Schmidt updated.",
+          dryRun: true,
+        },
+      },
+    });
+
+    const output = JSON.parse(result.content[0].text);
+    assert.equal(output.plan[0].method, "PUT");
+    assert.equal(output.plan[0].endpoint, "/issue/PROJ-9/comment/1001");
+    assert.deepStrictEqual(output.plan[0].body.body.content[0].content[0], {
+      type: "mention",
+      attrs: { id: "account-as", text: "@Anna Schmidt" },
+    });
+    assert.ok(fetchedUrls()[1].includes("/user/assignable/search?issueKey=PROJ-9&"));
   });
 });
 
