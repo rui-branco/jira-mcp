@@ -19,6 +19,7 @@ const os = require("os");
 const path = require("path");
 const fetch = require("node-fetch");
 const configStore = require("./config-store.js");
+const { ICONS } = require("./icons.js");
 const { spawn } = require("child_process");
 
 const PKG_VERSION = require("./package.json").version;
@@ -2471,7 +2472,7 @@ After the tool succeeds, its response echoes the posted comment as a markdown bl
 Structure with Markdown: a one/two-sentence overview, then ## / ### headings (Overview, Details, Acceptance Criteria), '-' bullet lists, numbered steps, tables for structured data, **bold** key terms, fenced \`\`\` blocks for code/payloads. Blank line between blocks. Concise and scannable. Never use em/en dashes.`;
 
 const server = new Server(
-  { name: "jira-mcp", version: PKG_VERSION },
+  { name: "jira-mcp", version: PKG_VERSION, icons: ICONS },
   { capabilities: { tools: { listChanged: true } }, instructions: SERVER_INSTRUCTIONS },
 );
 
