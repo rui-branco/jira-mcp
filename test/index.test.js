@@ -1425,8 +1425,8 @@ describe("serverInfo icons", () => {
     assert.equal(serverInfo.icons.length, 2);
     const source = fs.readFileSync(path.join(__dirname, "..", "assets", "icon.svg"), "utf8").trim();
     for (const [icon, theme, fill] of [
-      [serverInfo.icons[0], "light", "#000000"],
-      [serverInfo.icons[1], "dark", "#FFFFFF"],
+      [serverInfo.icons[0], "light", "#0052CC"],
+      [serverInfo.icons[1], "dark", "#2684FF"],
     ]) {
       assert.equal(icon.mimeType, "image/svg+xml");
       assert.deepStrictEqual(icon.sizes, ["any"]);
