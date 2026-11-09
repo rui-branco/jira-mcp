@@ -272,6 +272,7 @@ const TOOL_METADATA = {
   jira_search: { product: "jira", op: "read" },
   jira_search_users: { product: "jira", op: "read" },
   jira_get_changelog: { product: "jira", op: "read" },
+  jira_wait_for_change: { product: "jira", op: "read" },
   jira_list_instances: { product: "jira", op: "read" },
   jira_get_teams: { product: "jira", op: "read" },
   jira_get_link_types: { product: "jira", op: "read" },
@@ -396,10 +397,10 @@ function resolveDryRun(toolName, args, instance) {
 // Dry-run execution context. fetchJira/fetchConfluence check this and short-
 // circuit. Only the FIRST write in a chain is captured — multi-write tools
 // (e.g. transition with intermediate steps) report just step 1 with a note.
-const DRY_RUN_ABORT = Symbol("jira-mcp.dry-run-abort");
 // The state belongs to one tool call: runWithPolicy runs each call inside
 // _policyStore.run, so overlapping calls (parallel tool calls, a long
 // jira_wait_for_change) never see or reset each other's dry-run state.
+const DRY_RUN_ABORT = Symbol("jira-mcp.dry-run-abort");
 const _policyStore = new AsyncLocalStorage();
 const _policyCtx = {
   get dryRun() {
@@ -2468,6 +2469,229 @@ async function getChangelogsBulk(jql, maxResults = 50, instance = defaultInstanc
   return output;
 }
 
+// ============ WAIT FOR CHANGE ============
+
+// Resolves after ms, or as soon as the signal aborts.
+function abortableSleep(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+// accountId of the authenticated user, per instance
+const myAccountIdCache = new Map();
+
+async function myAccountId(instance) {
+  const cacheKey = instance.name || instance.baseUrl;
+  if (!myAccountIdCache.has(cacheKey)) {
+    const me = await fetchJira("/myself", {}, instance);
+    myAccountIdCache.set(cacheKey, me.accountId);
+  }
+  return myAccountIdCache.get(cacheKey);
+}
+
+// Comments and changelog entries on one issue after sinceMs, oldest first.
+async function findIssueChanges(issueKey, { sinceMs, watch, includeOwn, me }, instance) {
+  const changes = [];
+  const counts = (author) => includeOwn || author?.accountId !== me;
+  const cut = (value) => (typeof value === "string" ? value.slice(0, 300) : value);
+
+  if (watch.includes("comments") || watch.includes("any")) {
+    const data = await fetchJira(
+      `/issue/${issueKey}/comment?orderBy=-created&maxResults=20`,
+      {},
+      instance,
+    );
+    for (const comment of data.comments || []) {
+      if (!(Date.parse(comment.created) > sinceMs) || !counts(comment.author)) continue;
+      let text = extractTextSimple(comment.body);
+      if (text.length > 2000) text = text.slice(0, 2000) + "… [truncated]";
+      changes.push({
+        type: "comment",
+        issueKey,
+        id: comment.id,
+        author: comment.author?.displayName || "Unknown",
+        at: new Date(comment.created).toISOString(),
+        text,
+      });
+    }
+  }
+
+  if (watch.includes("status") || watch.includes("any")) {
+    const first = await fetchJira(`/issue/${issueKey}/changelog?maxResults=1`, {}, instance);
+    const total = first.total || 0;
+    const page = await fetchJira(
+      `/issue/${issueKey}/changelog?startAt=${Math.max(0, total - 50)}&maxResults=50`,
+      {},
+      instance,
+    );
+    for (const history of page.values || []) {
+      if (!(Date.parse(history.created) > sinceMs) || !counts(history.author)) continue;
+      const author = history.author?.displayName || "Unknown";
+      const at = new Date(history.created).toISOString();
+      for (const item of history.items || []) {
+        // item.toString is a field in Jira's JSON, but would fall back to
+        // Object.prototype.toString when the field is missing.
+        const from = item.fromString ?? null;
+        const to = Object.prototype.hasOwnProperty.call(item, "toString") ? item["toString"] : null;
+        if (item.field === "status") {
+          changes.push({ type: "status", issueKey, from, to, author, at });
+        } else if (watch.includes("any")) {
+          changes.push({ type: "update", issueKey, field: item.field, from: cut(from), to: cut(to), author, at });
+        }
+      }
+    }
+  }
+
+  return changes.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+}
+
+// Polls the issues until one of them has a change that counts, the timeout
+// passes, the signal aborts, or Jira cannot be read. sinceMs null means "from
+// now", taken from Jira's own clock: each key's `updated` at first sight, so a
+// local clock running ahead of Jira does not hide a change.
+async function waitForIssueChange({
+  issueKeys,
+  sinceMs,
+  watch,
+  includeOwn,
+  timeoutMs,
+  intervalMs,
+  instance,
+  signal,
+  sleep = abortableSleep,
+  now = Date.now,
+  maxFailedRounds = 5,
+}) {
+  const startedAt = now();
+  const me = includeOwn ? null : await myAccountId(instance);
+  const seen = new Map();
+  // Each key's own since, fixed at first sight. Kept even when that round
+  // fails, so a change made before the retry is still after it.
+  const sinceByKey = new Map();
+  const statuses = {};
+  let failedRounds = 0;
+  const newestSeenMs = () => {
+    const times = [];
+    for (const key of issueKeys) times.push(sinceByKey.get(key), Date.parse(seen.get(key)));
+    return Math.max(...times.filter(Number.isFinite));
+  };
+
+  while (true) {
+    if (signal?.aborted) return { cancelled: true };
+
+    const changes = [];
+    // `seen` only moves on after a clean round, so a change found on one key
+    // is not lost when a later request in the same round fails.
+    const roundSeen = new Map();
+    let roundError = null;
+    try {
+      for (const key of issueKeys) {
+        const issue = await fetchJira(`/issue/${key}?fields=updated,status`, {}, instance);
+        const updated = issue.fields?.updated;
+        statuses[key] = issue.fields?.status?.name;
+        if (!sinceByKey.has(key)) sinceByKey.set(key, sinceMs ?? Date.parse(updated));
+        const keySinceMs = sinceByKey.get(key);
+        const lookCloser = seen.has(key)
+          ? updated !== seen.get(key)
+          : Date.parse(updated) > keySinceMs;
+        if (lookCloser) {
+          changes.push(
+            ...(await findIssueChanges(key, { sinceMs: keySinceMs, watch, includeOwn, me }, instance)),
+          );
+        }
+        roundSeen.set(key, updated);
+      }
+    } catch (error) {
+      if ([401, 403, 404].includes(error.status)) return { failed: error.message };
+      roundError = error;
+    }
+
+    if (roundError) {
+      failedRounds += 1;
+      if (failedRounds >= maxFailedRounds) return { failed: roundError.message };
+    } else {
+      failedRounds = 0;
+      for (const [key, updated] of roundSeen) seen.set(key, updated);
+      if (changes.length > 0) {
+        // A ticket read earlier in this round may have changed before a later
+        // one was found changed. Read the others once more so that change is
+        // in this answer and not left behind the since it returns.
+        const changedKeys = new Set(changes.map((change) => change.issueKey));
+        for (const key of issueKeys) {
+          if (changedKeys.has(key)) continue;
+          try {
+            const issue = await fetchJira(`/issue/${key}?fields=updated,status`, {}, instance);
+            const updated = issue.fields?.updated;
+            if (updated !== seen.get(key)) {
+              changes.push(
+                ...(await findIssueChanges(
+                  key,
+                  { sinceMs: sinceByKey.get(key), watch, includeOwn, me },
+                  instance,
+                )),
+              );
+            }
+            statuses[key] = issue.fields?.status?.name;
+            seen.set(key, updated);
+          } catch {
+            // Skip this ticket: the wait still answers with what it found.
+          }
+        }
+        return {
+          found: changes.sort((a, b) => Date.parse(a.at) - Date.parse(b.at)),
+          statuses,
+          newestSeenMs: newestSeenMs(),
+        };
+      }
+    }
+
+    const elapsed = now() - startedAt;
+    if (elapsed >= timeoutMs) return { timedOut: true, statuses, newestSeenMs: newestSeenMs() };
+    let wait = Math.min(intervalMs, timeoutMs - elapsed);
+    if (roundError?.status === 429) wait = Math.max(wait, 60000);
+    await sleep(wait, signal);
+    if (signal?.aborted) return { cancelled: true };
+  }
+}
+
+// The jira_wait_for_change payload for a waitForIssueChange result.
+function waitAnswer(result, { sinceMs, timeoutSeconds }) {
+  if (result.found) {
+    const newest = Math.max(...result.found.map((change) => Date.parse(change.at)));
+    return {
+      done: true,
+      changes: result.found,
+      since: new Date(newest).toISOString(),
+      next: "To wait for the next change call jira_wait_for_change again with this since.",
+    };
+  }
+  if (result.timedOut) {
+    const baselineMs = Number.isFinite(result.newestSeenMs)
+      ? result.newestSeenMs
+      : Number.isFinite(sinceMs) ? sinceMs : Date.now();
+    return {
+      done: false,
+      timedOut: true,
+      waitedSeconds: timeoutSeconds,
+      statuses: result.statuses,
+      since: new Date(baselineMs).toISOString(),
+      next: "Nothing new yet. This is a timeout, not an answer: to keep waiting call jira_wait_for_change again with this since.",
+    };
+  }
+  if (result.cancelled) return { done: false, cancelled: true };
+  return { error: `The wait stopped because Jira could not be read: ${result.failed}` };
+}
+
 // ============ MCP SERVER ============
 
 const SERVER_INSTRUCTIONS = `# jira-mcp usage rules
@@ -2481,7 +2705,10 @@ Do NOT @mention automation/service accounts (e.g. 'Jira Integrations', bots): wh
 After the tool succeeds, its response echoes the posted comment as a markdown blockquote. ALWAYS reproduce that blockquote verbatim in your final reply to the user so they see exactly what was posted to Jira — never reply with just 'comment added' or a paraphrase.
 
 ## Writing descriptions (jira_create_ticket / jira_update_ticket / jira_create_subtask)
-Structure with Markdown: a one/two-sentence overview, then ## / ### headings (Overview, Details, Acceptance Criteria), '-' bullet lists, numbered steps, tables for structured data, **bold** key terms, fenced \`\`\` blocks for code/payloads. Blank line between blocks. Concise and scannable. Never use em/en dashes.`;
+Structure with Markdown: a one/two-sentence overview, then ## / ### headings (Overview, Details, Acceptance Criteria), '-' bullet lists, numbered steps, tables for structured data, **bold** key terms, fenced \`\`\` blocks for code/payloads. Blank line between blocks. Concise and scannable. Never use em/en dashes.
+
+## Waiting for a change on a ticket (jira_wait_for_change)
+When the user asks to keep checking a ticket, watch it, or wait for an answer or a status change, call jira_wait_for_change once. Do NOT fetch the ticket again and again on a schedule (no cron, loop or repeated jira_get_ticket): the wait tool checks by itself and nothing is spent while it waits. Say nothing while it waits. If it answers done: false and the user still wants to wait, call it again with the \`since\` it returned. It blocks the turn, so when the user wants to keep working in the same chat meanwhile, run the wait from a background agent or task if you have one.`;
 
 const server = new Server(
   { name: "jira-mcp", version: PKG_VERSION, icons: ICONS },
@@ -2840,6 +3067,56 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: [],
+        },
+      },
+      {
+        name: "jira_wait_for_change",
+        description:
+          "Wait for a change on a ticket. Blocks inside the server until someone other than you comments on the ticket or changes its status (or on one of alsoIssueKeys), then returns what changed. Use it instead of fetching a ticket again and again on a schedule: nothing is spent while it waits. After timeoutSeconds (default 1800, at most 14400) it answers done: false with the `since` to pass when you call it again to keep waiting.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueKey: {
+              type: "string",
+              description: "Ticket to watch, e.g. PROJ-123",
+            },
+            alsoIssueKeys: {
+              type: "array",
+              items: { type: "string" },
+              maxItems: 9,
+              description:
+                "More tickets to watch at the same time, in the same Jira instance; the wait ends when any of them changes",
+            },
+            watch: {
+              type: "array",
+              items: { type: "string", enum: ["comments", "status", "any"] },
+              description:
+                "What counts. Default: comments and status. `any` also counts every other field change",
+            },
+            includeOwn: {
+              type: "boolean",
+              description: "Also count your own comments and changes. Default false",
+            },
+            since: {
+              type: "string",
+              description:
+                "ISO time. Changes after it count, including ones that already happened. Default: after the ticket's last update right now. Pass the `since` a previous call returned to continue without missing anything",
+            },
+            timeoutSeconds: {
+              type: "number",
+              description:
+                "How long to wait before answering done: false (10 to 14400). Default 1800",
+            },
+            intervalSeconds: {
+              type: "number",
+              description: "Seconds between checks (15 to 900). Default 60",
+            },
+            instance: {
+              type: "string",
+              description: "Instance name (optional).",
+            },
+          },
+          required: ["issueKey"],
         },
       },
       {
@@ -3921,7 +4198,7 @@ async function runWithPolicy(name, args, handler) {
   });
 }
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
 
   if (name === "confluence_enable") {
@@ -4429,6 +4706,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await getChangelogsBulk(args.jql, args.maxResults || 50, inst);
         return { content: [{ type: "text", text: result }] };
       }
+    } else if (name === "jira_wait_for_change") {
+      if (!args.issueKey) {
+        return {
+          content: [{ type: "text", text: "Error: issueKey is required." }],
+          isError: true,
+        };
+      }
+      // No since: waitForIssueChange takes "now" from Jira, not this clock.
+      const sinceMs = args.since ? Date.parse(args.since) : null;
+      if (Number.isNaN(sinceMs)) {
+        return {
+          content: [{ type: "text", text: "Error: since must be an ISO time, e.g. 2026-01-31T09:30:00Z" }],
+          isError: true,
+        };
+      }
+      const watchKinds = ["comments", "status", "any"];
+      let watch = Array.isArray(args.watch) ? args.watch.filter((w) => watchKinds.includes(w)) : [];
+      if (watch.length === 0) watch = ["comments", "status"];
+      const timeoutSeconds = Math.min(14400, Math.max(10, Number(args.timeoutSeconds) || 1800));
+      const intervalSeconds = Math.min(900, Math.max(15, Number(args.intervalSeconds) || 60));
+      const inst = args.instance
+        ? getInstanceByName(args.instance)
+        : getInstanceForKey(args.issueKey);
+      const issueKeys = [
+        ...new Set(
+          [args.issueKey, ...(Array.isArray(args.alsoIssueKeys) ? args.alsoIssueKeys.slice(0, 9) : [])]
+            .map((key) => String(key).trim().toUpperCase()),
+        ),
+      ];
+      const result = await waitForIssueChange({
+        issueKeys,
+        sinceMs,
+        watch,
+        includeOwn: Boolean(args.includeOwn),
+        timeoutMs: timeoutSeconds * 1000,
+        intervalMs: intervalSeconds * 1000,
+        instance: inst,
+        signal: extra?.signal,
+      });
+      const payload = waitAnswer(result, { sinceMs, timeoutSeconds });
+      const response = { content: [{ type: "text", text: JSON.stringify(payload) }] };
+      if (payload.error) response.isError = true;
+      return response;
     } else if (name === "jira_add_instance") {
       const instName = args.name.trim();
       const existingIdx = instances.findIndex((i) => i.name === instName);
@@ -5912,5 +6232,7 @@ if (typeof module !== "undefined") {
     persistDiscoveredProjects, resolveInstanceForTool, _injectDryRunSchema,
     resolveSessionDefault,
     AUDIT_LOG_PATH,
+    // jira_wait_for_change
+    abortableSleep, myAccountId, findIssueChanges, waitForIssueChange, waitAnswer,
   };
 }

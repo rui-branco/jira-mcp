@@ -194,6 +194,7 @@ To enable Figma integration:
 | `jira_delete_comment` | Delete a comment (irreversible) | `issueKey` (required), `commentId` (required) |
 | `jira_transition` | Change ticket status by name or ID (auto-handles intermediate steps) | `issueKey` (required), `targetStatus` or `transitionId` |
 | `jira_update_ticket` | Update ticket fields (summary, description, assignee, priority, labels) | `issueKey` (required), plus optional field parameters |
+| `jira_wait_for_change` | Wait inside the server until someone else comments on a ticket or changes its status, then return what changed (or `done: false` with a `since` to continue after the timeout) | `issueKey` (required), `alsoIssueKeys`, `watch`, `includeOwn`, `since`, `timeoutSeconds`, `intervalSeconds` |
 
 ### Confluence Tools
 
