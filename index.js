@@ -21,6 +21,7 @@ const fetch = require("node-fetch");
 const configStore = require("./config-store.js");
 const { ICONS } = require("./icons.js");
 const { spawn } = require("child_process");
+const { AsyncLocalStorage } = require("node:async_hooks");
 
 const PKG_VERSION = require("./package.json").version;
 
@@ -396,7 +397,18 @@ function resolveDryRun(toolName, args, instance) {
 // circuit. Only the FIRST write in a chain is captured — multi-write tools
 // (e.g. transition with intermediate steps) report just step 1 with a note.
 const DRY_RUN_ABORT = Symbol("jira-mcp.dry-run-abort");
-const _policyCtx = { dryRun: false, plan: null };
+// The state belongs to one tool call: runWithPolicy runs each call inside
+// _policyStore.run, so overlapping calls (parallel tool calls, a long
+// jira_wait_for_change) never see or reset each other's dry-run state.
+const _policyStore = new AsyncLocalStorage();
+const _policyCtx = {
+  get dryRun() {
+    return _policyStore.getStore()?.dryRun ?? false;
+  },
+  get plan() {
+    return _policyStore.getStore()?.plan ?? null;
+  },
+};
 
 function recordDryRunCall(call) {
   if (_policyCtx.plan) _policyCtx.plan.push(call);
@@ -3851,65 +3863,62 @@ async function runWithPolicy(name, args, handler) {
     }
   }
 
-  // 4. Execute under policy context
-  _policyCtx.dryRun = dryRun;
-  _policyCtx.plan = dryRun ? [] : null;
-  try {
-    const result = await handler();
-    if (meta && meta.op !== "read") {
-      audit({
-        tool: name,
-        instance: inst.name,
-        target: extractTarget(args),
-        args: scrubArgs(args),
-        dryRun,
-        success: true,
-      });
-    }
-    return result;
-  } catch (error) {
-    if (error === DRY_RUN_ABORT) {
-      const plan = _policyCtx.plan || [];
-      audit({
-        tool: name,
-        instance: inst.name,
-        target: extractTarget(args),
-        args: scrubArgs(args),
-        dryRun: true,
-        success: true,
-        status: "dry-run",
-        plan,
-      });
+  // 4. Execute under this call's own policy context
+  return _policyStore.run({ dryRun, plan: dryRun ? [] : null }, async () => {
+    try {
+      const result = await handler();
+      if (meta && meta.op !== "read") {
+        audit({
+          tool: name,
+          instance: inst.name,
+          target: extractTarget(args),
+          args: scrubArgs(args),
+          dryRun,
+          success: true,
+        });
+      }
+      return result;
+    } catch (error) {
+      if (error === DRY_RUN_ABORT) {
+        const plan = _policyCtx.plan || [];
+        audit({
+          tool: name,
+          instance: inst.name,
+          target: extractTarget(args),
+          args: scrubArgs(args),
+          dryRun: true,
+          success: true,
+          status: "dry-run",
+          plan,
+        });
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              dryRun: true,
+              note: "Plan shows the first HTTP write only. Multi-step tools (e.g. jira_transition with intermediate steps) execute the remaining writes when run for real.",
+              plan,
+            }, null, 2),
+          }],
+        };
+      }
+      if (meta && meta.op !== "read") {
+        audit({
+          tool: name,
+          instance: inst.name,
+          target: extractTarget(args),
+          args: scrubArgs(args),
+          dryRun,
+          success: false,
+          error: error.message,
+        });
+      }
       return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            dryRun: true,
-            note: "Plan shows the first HTTP write only. Multi-step tools (e.g. jira_transition with intermediate steps) execute the remaining writes when run for real.",
-            plan,
-          }, null, 2),
-        }],
+        content: [{ type: "text", text: `Error: ${error.message}` }],
+        isError: true,
       };
     }
-    if (meta && meta.op !== "read") {
-      audit({
-        tool: name,
-        instance: inst.name,
-        target: extractTarget(args),
-        args: scrubArgs(args),
-        dryRun,
-        success: false,
-        error: error.message,
-      });
-    }
-    return {
-      content: [{ type: "text", text: `Error: ${error.message}` }],
-      isError: true,
-    };
-  } finally {
-    _policyCtx.dryRun = false;
-    _policyCtx.plan = null;
-  }
+  });
 }
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
