@@ -2558,10 +2558,14 @@ async function findIssueChanges(issueKey, { sinceMs, watch, includeOwn, me }, in
 // Polls the issues until one of them has a change that counts, the timeout
 // passes, the signal aborts, or Jira cannot be read. sinceMs null means "from
 // now", taken from Jira's own clock: each key's `updated` at first sight, so a
-// local clock running ahead of Jira does not hide a change.
+// local clock running ahead of Jira does not hide a change. sinceByKey gives
+// some keys their since up front (a stopped wait picked up again), and
+// onBaseline hears each since the loop fixes itself.
 async function waitForIssueChange({
   issueKeys,
   sinceMs,
+  sinceByKey: givenSinceByKey,
+  onBaseline = () => {},
   watch,
   includeOwn,
   timeoutMs,
@@ -2577,7 +2581,7 @@ async function waitForIssueChange({
   const seen = new Map();
   // Each key's own since, fixed at first sight. Kept even when that round
   // fails, so a change made before the retry is still after it.
-  const sinceByKey = new Map();
+  const sinceByKey = new Map(givenSinceByKey);
   const statuses = {};
   let failedRounds = 0;
   const newestSeenMs = () => {
@@ -2599,7 +2603,10 @@ async function waitForIssueChange({
         const issue = await fetchJira(`/issue/${key}?fields=updated,status`, {}, instance);
         const updated = issue.fields?.updated;
         statuses[key] = issue.fields?.status?.name;
-        if (!sinceByKey.has(key)) sinceByKey.set(key, sinceMs ?? Date.parse(updated));
+        if (!sinceByKey.has(key)) {
+          sinceByKey.set(key, sinceMs ?? Date.parse(updated));
+          onBaseline(key, sinceByKey.get(key));
+        }
         const keySinceMs = sinceByKey.get(key);
         const lookCloser = seen.has(key)
           ? updated !== seen.get(key)
@@ -2664,6 +2671,37 @@ async function waitForIssueChange({
   }
 }
 
+// Each watched ticket's since while its wait runs, and for a while after the
+// wait is stopped, so a wait started again without since picks up there.
+// Keyed by the upper-cased issue key: { sinceMs, owner, startedAt, stoppedAt }.
+const waitBaselines = new Map();
+let waitCallCount = 0;
+
+function noteWaitStart(map, key, sinceMs, callId, now) {
+  map.set(key, { sinceMs, owner: callId, startedAt: now, stoppedAt: null });
+}
+
+function noteWaitStopped(map, key, callId, now) {
+  const entry = map.get(key);
+  if (entry?.owner === callId) entry.stoppedAt = now;
+}
+
+// Only the call that owns the entry removes it: an older call ending late
+// must not drop a newer call's since.
+function noteWaitEnded(map, key, callId) {
+  if (map.get(key)?.owner === callId) map.delete(key);
+}
+
+// The since to pick up from: the running wait's, or a stopped one's for
+// ttlMs after it stopped. null when there is none.
+function resumeSince(map, key, now, ttlMs = 60 * 60 * 1000) {
+  const entry = map.get(key);
+  if (!entry) return null;
+  if (entry.stoppedAt === null || now - entry.stoppedAt < ttlMs) return entry.sinceMs;
+  map.delete(key);
+  return null;
+}
+
 // The jira_wait_for_change payload for a waitForIssueChange result.
 function waitAnswer(result, { sinceMs, timeoutSeconds }) {
   if (result.found) {
@@ -2708,7 +2746,7 @@ After the tool succeeds, its response echoes the posted comment as a markdown bl
 Structure with Markdown: a one/two-sentence overview, then ## / ### headings (Overview, Details, Acceptance Criteria), '-' bullet lists, numbered steps, tables for structured data, **bold** key terms, fenced \`\`\` blocks for code/payloads. Blank line between blocks. Concise and scannable. Never use em/en dashes.
 
 ## Waiting for a change on a ticket (jira_wait_for_change)
-When the user asks to keep checking a ticket, watch it, or wait for an answer or a status change, call jira_wait_for_change once. Do NOT fetch the ticket again and again on a schedule (no cron, loop or repeated jira_get_ticket): the wait tool checks by itself and nothing is spent while it waits. Say nothing while it waits. If it answers done: false and the user still wants to wait, call it again with the \`since\` it returned. It blocks the turn, so when the user wants to keep working in the same chat meanwhile, run the wait from a background agent or task if you have one.`;
+When the user asks to keep checking a ticket, watch it, or wait for an answer or a status change, call jira_wait_for_change once. Do NOT fetch the ticket again and again on a schedule (no cron, loop or repeated jira_get_ticket): the wait tool checks by itself and nothing is spent while it waits. Say nothing while it waits. If it answers done: false and the user still wants to wait, call it again with the \`since\` it returned. A wait started again for the same ticket within an hour of a stopped one picks up where the stopped one left off, so nothing that changed in between is missed. It blocks the turn, so when the user wants to keep working in the same chat meanwhile, run the wait from a background agent or task if you have one.`;
 
 const server = new Server(
   { name: "jira-mcp", version: PKG_VERSION, icons: ICONS },
@@ -3072,7 +3110,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "jira_wait_for_change",
         description:
-          "Wait for a change on a ticket. Blocks inside the server until someone other than you comments on the ticket or changes its status (or on one of alsoIssueKeys), then returns what changed. Use it instead of fetching a ticket again and again on a schedule: nothing is spent while it waits. After timeoutSeconds (default 1800, at most 14400) it answers done: false with the `since` to pass when you call it again to keep waiting.",
+          "Wait for a change on a ticket. Blocks inside the server until someone other than you comments on the ticket or changes its status (or on one of alsoIssueKeys), then returns what changed. Use it instead of fetching a ticket again and again on a schedule: nothing is spent while it waits. After timeoutSeconds (default 1800, at most 14400) it answers done: false with the `since` to pass when you call it again to keep waiting. A wait started again for the same ticket within an hour of a stopped one picks up where the stopped one left off, so nothing that changed in between is missed.",
         inputSchema: {
           type: "object",
           properties: {
@@ -3100,7 +3138,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             since: {
               type: "string",
               description:
-                "ISO time. Changes after it count, including ones that already happened. Default: after the ticket's last update right now. Pass the `since` a previous call returned to continue without missing anything",
+                "ISO time. Changes after it count, including ones that already happened. Default: after the ticket's last update right now, or where a wait stopped in the last hour left off. Pass the `since` a previous call returned to continue without missing anything",
             },
             timeoutSeconds: {
               type: "number",
@@ -4735,16 +4773,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             .map((key) => String(key).trim().toUpperCase()),
         ),
       ];
-      const result = await waitForIssueChange({
-        issueKeys,
-        sinceMs,
-        watch,
-        includeOwn: Boolean(args.includeOwn),
-        timeoutMs: timeoutSeconds * 1000,
-        intervalMs: intervalSeconds * 1000,
-        instance: inst,
-        signal: extra?.signal,
-      });
+      const waitCallId = ++waitCallCount;
+      // No since: pick up a stopped wait on the same ticket where it left off.
+      const resumedSinceByKey = new Map();
+      if (sinceMs === null) {
+        for (const key of issueKeys) {
+          const resumedMs = resumeSince(waitBaselines, key, Date.now());
+          if (resumedMs === null) continue;
+          resumedSinceByKey.set(key, resumedMs);
+          noteWaitStart(waitBaselines, key, resumedMs, waitCallId, Date.now());
+        }
+      }
+      let result;
+      try {
+        result = await waitForIssueChange({
+          issueKeys,
+          sinceMs,
+          sinceByKey: resumedSinceByKey,
+          onBaseline: (key, keySinceMs) =>
+            noteWaitStart(waitBaselines, key, keySinceMs, waitCallId, Date.now()),
+          watch,
+          includeOwn: Boolean(args.includeOwn),
+          timeoutMs: timeoutSeconds * 1000,
+          intervalMs: intervalSeconds * 1000,
+          instance: inst,
+          signal: extra?.signal,
+        });
+      } finally {
+        // A stopped wait keeps its since for the next one; any other end drops it.
+        for (const key of issueKeys) {
+          if (result?.cancelled) noteWaitStopped(waitBaselines, key, waitCallId, Date.now());
+          else noteWaitEnded(waitBaselines, key, waitCallId);
+        }
+      }
       const payload = waitAnswer(result, { sinceMs, timeoutSeconds });
       const response = { content: [{ type: "text", text: JSON.stringify(payload) }] };
       if (payload.error) response.isError = true;
@@ -6234,5 +6295,6 @@ if (typeof module !== "undefined") {
     AUDIT_LOG_PATH,
     // jira_wait_for_change
     abortableSleep, myAccountId, findIssueChanges, waitForIssueChange, waitAnswer,
+    noteWaitStart, noteWaitStopped, noteWaitEnded, resumeSince,
   };
 }

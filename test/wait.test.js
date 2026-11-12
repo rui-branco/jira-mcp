@@ -95,6 +95,10 @@ const {
   findIssueChanges,
   waitForIssueChange,
   waitAnswer,
+  noteWaitStart,
+  noteWaitStopped,
+  noteWaitEnded,
+  resumeSince,
 } = require("../index.js");
 
 const acme = {
@@ -826,6 +830,74 @@ describe("waitAnswer", () => {
   });
 });
 
+// ============ picking up a stopped wait ============
+
+describe("wait baselines", () => {
+  const HOUR = 60 * MINUTE;
+
+  it("noteWaitStart records the since, owner and start", () => {
+    const map = new Map();
+    noteWaitStart(map, "ACME-1", T0, 1, T0 + SECOND);
+    assert.deepStrictEqual(map.get("ACME-1"), { sinceMs: T0, owner: 1, startedAt: T0 + SECOND, stoppedAt: null });
+  });
+
+  it("noteWaitStopped marks the entry only for its owner", () => {
+    const map = new Map();
+    noteWaitStart(map, "ACME-1", T0, 2, T0);
+    noteWaitStopped(map, "ACME-1", 1, T0 + MINUTE);
+    assert.equal(map.get("ACME-1").stoppedAt, null);
+    noteWaitStopped(map, "ACME-1", 2, T0 + MINUTE);
+    assert.equal(map.get("ACME-1").stoppedAt, T0 + MINUTE);
+  });
+
+  it("noteWaitStopped does nothing without an entry", () => {
+    const map = new Map();
+    noteWaitStopped(map, "ACME-1", 1, T0);
+    assert.equal(map.has("ACME-1"), false);
+  });
+
+  it("noteWaitEnded removes the entry only for its owner", () => {
+    const map = new Map();
+    noteWaitStart(map, "ACME-1", T0, 2, T0);
+    // An older call ending late keeps the newer call's entry
+    noteWaitEnded(map, "ACME-1", 1);
+    assert.equal(map.get("ACME-1").owner, 2);
+    noteWaitEnded(map, "ACME-1", 2);
+    assert.equal(map.has("ACME-1"), false);
+  });
+
+  it("resumeSince returns the since of a running wait", () => {
+    const map = new Map();
+    noteWaitStart(map, "ACME-1", T0, 1, T0);
+    assert.equal(resumeSince(map, "ACME-1", T0 + 5 * HOUR), T0);
+  });
+
+  it("resumeSince returns the since of a wait stopped within the ttl", () => {
+    const map = new Map();
+    noteWaitStart(map, "ACME-1", T0, 1, T0);
+    noteWaitStopped(map, "ACME-1", 1, T0 + MINUTE);
+    assert.equal(resumeSince(map, "ACME-1", T0 + MINUTE + HOUR - SECOND), T0);
+    assert.equal(resumeSince(map, "ACME-1", T0 + 2 * MINUTE, 2 * MINUTE), T0);
+  });
+
+  it("resumeSince drops a wait stopped for the ttl or longer", () => {
+    const map = new Map();
+    noteWaitStart(map, "ACME-1", T0, 1, T0);
+    noteWaitStopped(map, "ACME-1", 1, T0 + MINUTE);
+    assert.equal(resumeSince(map, "ACME-1", T0 + MINUTE + HOUR), null);
+    assert.equal(map.has("ACME-1"), false);
+
+    noteWaitStart(map, "ACME-2", T0, 1, T0);
+    noteWaitStopped(map, "ACME-2", 1, T0);
+    assert.equal(resumeSince(map, "ACME-2", T0 + 3 * MINUTE, 2 * MINUTE), null);
+    assert.equal(map.has("ACME-2"), false);
+  });
+
+  it("resumeSince returns null when there is no entry", () => {
+    assert.equal(resumeSince(new Map(), "ACME-1", T0), null);
+  });
+});
+
 // ============ jira_wait_for_change tool ============
 
 describe("jira_wait_for_change tool", () => {
@@ -914,6 +986,43 @@ describe("jira_wait_for_change tool", () => {
     );
     assert.deepStrictEqual(JSON.parse(result.content[0].text), { done: false, cancelled: true });
     assert.deepStrictEqual(fetchedPaths(), ["/issue/ACME-1?fields=updated,status"]);
+  });
+
+  it("without since picks up a stopped wait and reports a change made in between", async () => {
+    const lastUpdate = Date.now() - 10 * MINUTE;
+    const tickets = {
+      "ACME-77": { updated: jiraTime(lastUpdate), status: "To Do" },
+    };
+    const answers = ticketAnswers(tickets);
+    const call = (signal) =>
+      callToolHandler(
+        { params: { name: "jira_wait_for_change", arguments: { issueKey: "acme-77" } } },
+        { signal },
+      );
+
+    // The first wait takes its baseline from Jira, then is stopped
+    const first = new AbortController();
+    serve((apiPath) => {
+      first.abort();
+      return answers(apiPath);
+    });
+    const stopped = await call(first.signal);
+    assert.deepStrictEqual(JSON.parse(stopped.content[0].text), { done: false, cancelled: true });
+
+    // Alex answers while no wait runs
+    tickets["ACME-77"].updated = jiraTime(lastUpdate + MINUTE);
+    tickets["ACME-77"].comments = [comment("10090", alex, lastUpdate + MINUTE, "Answered in between")];
+
+    // Stops after its first round, so a miss answers cancelled instead of sleeping
+    const second = new AbortController();
+    serve((apiPath) => {
+      second.abort();
+      return answers(apiPath);
+    });
+    const resumed = await call(second.signal);
+    const payload = JSON.parse(resumed.content[0].text);
+    assert.equal(payload.done, true);
+    assert.deepStrictEqual(payload.changes.map((c) => [c.issueKey, c.id]), [["ACME-77", "10090"]]);
   });
 
   it("watches at most 9 extra tickets", async () => {
